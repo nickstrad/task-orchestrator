@@ -8,6 +8,6 @@ type Node struct {
 	MemoryAllocated int
 	Disk            int
 	DiskAllocated   int
-	role            string
+	Role            string
 	TaskCount       int
 }
