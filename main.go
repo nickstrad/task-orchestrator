@@ -2,10 +2,12 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/golang-collections/collections/queue"
 	"github.com/google/uuid"
+	"github.com/moby/moby/client"
 	"github.com/nickstrad/task-orchestrator/internal/manager"
 	"github.com/nickstrad/task-orchestrator/internal/node"
 	"github.com/nickstrad/task-orchestrator/internal/task"
@@ -65,4 +67,58 @@ func main() {
 	}
 
 	fmt.Printf("node: %v\n", n)
+
+	dockerCreateTask, createResult := createContainer()
+	if createResult.Error != nil {
+		fmt.Printf("%v", createResult.Error)
+		os.Exit(1)
+	}
+
+	time.Sleep(time.Second * 10)
+	deleteResult := stopContainer(dockerCreateTask, createResult.ContainerId)
+
+	if deleteResult.Error != nil {
+		fmt.Printf("%v", deleteResult.Error)
+		os.Exit(1)
+	}
+
+	fmt.Printf("successfull stopped conatiner '%s'\n", deleteResult.ContainerId)
+}
+
+func createContainer() (*task.Docker, *task.DockerResult) {
+	taskConfig := task.Config{
+		Name:  "test-container-1",
+		Image: "postgres:13",
+		Env: []string{
+			"POSTGRES_USER=task-orchestrator",
+			"POSTGRES_PASSWORD=task-orchestrator",
+		},
+	}
+
+	dockerClient, _ := client.New(client.FromEnv)
+
+	dockerTask := task.Docker{
+		Client: dockerClient,
+		Config: taskConfig,
+	}
+	result := dockerTask.Run()
+	if result.Error != nil {
+		fmt.Printf("%v\n", result.Error.Message)
+		return nil, result
+	}
+
+	fmt.Printf("Container %s is running with config %v\n", result.ContainerId, taskConfig)
+	return &dockerTask, result
+}
+
+func stopContainer(dockerTask *task.Docker, id string) *task.DockerResult {
+
+	result := dockerTask.Stop(id)
+	if result.Error != nil {
+		fmt.Printf("%v\n", result.Error.Message)
+		return nil
+	}
+
+	fmt.Printf("Container %s has been stopped\n", result.ContainerId)
+	return result
 }
