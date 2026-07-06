@@ -9,7 +9,6 @@ import (
 
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
-	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 )
 
@@ -25,24 +24,32 @@ type DockerResult struct {
 	Result      string
 }
 
-type Config struct {
-	Name          string
-	AttachStdin   bool
-	AttachStdout  bool
-	AttachStderr  bool
-	ExposedPorts  network.PortSet
-	ContainerID   string
-	Cmd           []string
-	Image         string
-	Cpu           float64
-	Memory        int64
-	Disk          int64
-	Env           []string
-	RestartPolicy string
+func NewDocker(config Config) *Docker {
+	dockerClient, _ := client.New(client.FromEnv)
+	return &Docker{
+		Client: dockerClient,
+		Config: config,
+	}
 }
 
-func newDockerResult(err *TaskError, action, containerId, result string) *DockerResult {
-	d := &DockerResult{
+func NewConfig(t Task) Config {
+	config := Config{
+		Name:          t.Name,
+		Image:         t.Image,
+		Memory:        int64(t.Memory),
+		Disk:          int64(t.Disk),
+		RestartPolicy: t.RestartPolicy,
+	}
+
+	if t.ExposedPorts != nil {
+		config.ExposedPorts = t.ExposedPorts
+	}
+
+	return config
+}
+
+func NewDockerResult(err *TaskError, action, containerId, result string) DockerResult {
+	d := DockerResult{
 		Action:      action,
 		ContainerId: containerId,
 		Result:      result,
@@ -55,15 +62,15 @@ func newDockerResult(err *TaskError, action, containerId, result string) *Docker
 	return d
 }
 
-func (d *Docker) Run() *DockerResult {
+func (d *Docker) Run() DockerResult {
 	ctx := context.Background()
 	reader, err := d.Client.ImagePull(
 		ctx, d.Config.Image, client.ImagePullOptions{},
 	)
 
 	if err != nil {
-		taskError := wrapError(err, "Error pulling image %s: %v\n", d.Config.Image, err)
-		return newDockerResult(taskError, "", "", "")
+		taskError := WrapError(err, "Error pulling image %s: %v\n", d.Config.Image, err)
+		return NewDockerResult(taskError, "", "", "")
 	}
 
 	io.Copy(os.Stdout, reader)
@@ -97,15 +104,15 @@ func (d *Docker) Run() *DockerResult {
 
 	containerCreateResp, err := d.Client.ContainerCreate(ctx, containerCreateOptions)
 	if err != nil {
-		taskError := wrapError(err, "Error creating container using image %s: %v\n", d.Config.Image, err)
-		return newDockerResult(taskError, "", "", "")
+		taskError := WrapError(err, "Error creating container using image %s: %v\n", d.Config.Image, err)
+		return NewDockerResult(taskError, "", "", "")
 	}
 
 	containerStartOptions := client.ContainerStartOptions{}
 	_, err = d.Client.ContainerStart(ctx, containerCreateResp.ID, containerStartOptions)
 	if err != nil {
-		taskError := wrapError(err, "Error starting container with id %s: %v\n", containerCreateResp.ID, err)
-		return newDockerResult(taskError, "", "", "")
+		taskError := WrapError(err, "Error starting container with id %s: %v\n", containerCreateResp.ID, err)
+		return NewDockerResult(taskError, "", "", "")
 	}
 
 	d.Config.ContainerID = containerCreateResp.ID
@@ -116,32 +123,32 @@ func (d *Docker) Run() *DockerResult {
 	}
 	out, err := d.Client.ContainerLogs(ctx, containerCreateResp.ID, containerLogOptions)
 	if err != nil {
-		taskError := wrapError(err, "Error getting logs from container with id %s: %v\n", containerCreateResp.ID, err)
-		return newDockerResult(taskError, "", "", "")
+		taskError := WrapError(err, "Error getting logs from container with id %s: %v\n", containerCreateResp.ID, err)
+		return NewDockerResult(taskError, "", "", "")
 	}
 
 	stdcopy.StdCopy(os.Stdout, os.Stderr, out)
-	return newDockerResult(nil, "start", containerCreateResp.ID, "success")
+	return NewDockerResult(nil, "start", containerCreateResp.ID, "success")
 }
 
-func (d *Docker) Stop(id string) *DockerResult {
+func (d *Docker) Stop(id string) DockerResult {
 	log.Printf("Attempting to stop container %v", id)
 	ctx := context.Background()
 
 	containerStopOptions := client.ContainerStopOptions{}
 	_, err := d.Client.ContainerStop(ctx, id, containerStopOptions)
 	if err != nil {
-		taskError := wrapError(err, "Error stopping container with id %s: %v\n", id, err)
-		return newDockerResult(taskError, "", "", "")
+		taskError := WrapError(err, "Error stopping container with id %s: %v\n", id, err)
+		return NewDockerResult(taskError, "", "", "")
 	}
 
 	containerRemoveOptions := client.ContainerRemoveOptions{}
 
 	_, err = d.Client.ContainerRemove(ctx, id, containerRemoveOptions)
 	if err != nil {
-		taskError := wrapError(err, "Error removing container with id %s: %v\n", id, err)
-		return newDockerResult(taskError, "", "", "")
+		taskError := WrapError(err, "Error removing container with id %s: %v\n", id, err)
+		return NewDockerResult(taskError, "", "", "")
 	}
 
-	return newDockerResult(nil, "stop", id, "success")
+	return NewDockerResult(nil, "stop", id, "success")
 }

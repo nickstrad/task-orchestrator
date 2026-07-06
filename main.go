@@ -2,12 +2,11 @@ package main
 
 import (
 	"fmt"
-	"os"
+	"sync"
 	"time"
 
 	"github.com/golang-collections/collections/queue"
 	"github.com/google/uuid"
-	"github.com/moby/moby/client"
 	"github.com/nickstrad/task-orchestrator/internal/manager"
 	"github.com/nickstrad/task-orchestrator/internal/node"
 	"github.com/nickstrad/task-orchestrator/internal/task"
@@ -16,40 +15,12 @@ import (
 
 func main() {
 
-	t := task.Task{
-		ID:     uuid.New(),
-		Name:   "Task-1",
-		State:  task.Pending,
-		Image:  "Image-1",
-		Memory: 1024,
-		Disk:   1,
-	}
-	te := task.TaskEvent{
-		ID:        uuid.New(),
-		State:     task.Pending,
-		Timestamp: time.Now(),
-		Task:      t,
-	}
-
-	fmt.Printf("task: %v\n", t)
-	fmt.Printf("task event: %v\n", te)
-
-	w := worker.Worker{
-		Name:  "worker-1",
-		Queue: *queue.New(),
-		Db:    make(map[uuid.UUID]*task.Task),
-	}
-	fmt.Printf("worker: %v\n", w)
-	w.CollectStats()
-	w.RunTask()
-	w.StartTask()
-	w.StopTask()
-
+	worker := worker.NewWorker("test")
 	m := manager.Manager{
 		Pending: *queue.New(),
 		TaskDb:  make(map[string][]*task.Task),
 		EventDb: make(map[string][]*task.TaskEvent),
-		Workers: []string{w.Name},
+		Workers: []string{worker.Name},
 	}
 
 	fmt.Printf("manager: %v\n", m)
@@ -65,60 +36,111 @@ func main() {
 		Disk:   25,
 		Role:   "worker",
 	}
-
 	fmt.Printf("node: %v\n", n)
 
-	dockerCreateTask, createResult := createContainer()
-	if createResult.Error != nil {
-		fmt.Printf("%v", createResult.Error)
-		os.Exit(1)
-	}
+	var wg sync.WaitGroup
 
-	time.Sleep(time.Second * 10)
-	deleteResult := stopContainer(dockerCreateTask, createResult.ContainerId)
+	wg.Go(func() {
+		stream := doWork(task.Task{
+			ID:    uuid.New(),
+			Name:  "test-container-1",
+			State: task.Scheduled,
+			Image: "strm/helloworld-http",
+		}, "worker-1", 10)
 
-	if deleteResult.Error != nil {
-		fmt.Printf("%v", deleteResult.Error)
-		os.Exit(1)
-	}
+		for v := range stream {
+			if v.Error != nil {
+				fmt.Printf("%v", v.Error)
+				continue
+			}
+			fmt.Println(v.Update)
+		}
+	})
 
-	fmt.Printf("successfull stopped conatiner '%s'\n", deleteResult.ContainerId)
+	wg.Go(func() {
+		stream := doWork(task.Task{
+			ID:    uuid.New(),
+			Name:  "test-container-2",
+			State: task.Scheduled,
+			Image: "strm/helloworld-http",
+		}, "worker-2", 10)
+
+		for v := range stream {
+			if v.Error != nil {
+				fmt.Printf("%v", v.Error)
+				continue
+			}
+			fmt.Println(v.Update)
+		}
+	})
+
+	wg.Go(func() {
+		stream := doWork(task.Task{
+			ID:    uuid.New(),
+			Name:  "test-container-3",
+			State: task.Scheduled,
+			Image: "strm/helloworld-http",
+		}, "worker-3", 10)
+
+		for v := range stream {
+			if v.Error != nil {
+				fmt.Printf("%v", v.Error)
+				continue
+			}
+			fmt.Println(v.Update)
+		}
+	})
+
+	wg.Wait()
 }
 
-func createContainer() (*task.Docker, *task.DockerResult) {
-	taskConfig := task.Config{
-		Name:  "test-container-1",
-		Image: "postgres:13",
-		Env: []string{
-			"POSTGRES_USER=task-orchestrator",
-			"POSTGRES_PASSWORD=task-orchestrator",
-		},
-	}
-
-	dockerClient, _ := client.New(client.FromEnv)
-
-	dockerTask := task.Docker{
-		Client: dockerClient,
-		Config: taskConfig,
-	}
-	result := dockerTask.Run()
-	if result.Error != nil {
-		fmt.Printf("%v\n", result.Error.Message)
-		return nil, result
-	}
-
-	fmt.Printf("Container %s is running with config %v\n", result.ContainerId, taskConfig)
-	return &dockerTask, result
+type UpdateValue struct {
+	Update string
+	Error  error
 }
 
-func stopContainer(dockerTask *task.Docker, id string) *task.DockerResult {
+func doWork(workerTask task.Task, workerName string, sleepTimeSecs int) <-chan UpdateValue {
 
-	result := dockerTask.Stop(id)
-	if result.Error != nil {
-		fmt.Printf("%v\n", result.Error.Message)
-		return nil
+	if sleepTimeSecs == 0 {
+		sleepTimeSecs = 5
 	}
 
-	fmt.Printf("Container %s has been stopped\n", result.ContainerId)
-	return result
+	valueStream := make(chan UpdateValue)
+	var wg sync.WaitGroup
+
+	wg.Go(func() {
+		worker := worker.NewWorker(workerName)
+
+		valueStream <- UpdateValue{Update: fmt.Sprintf("%s: starting task", workerName)}
+		worker.AddTask(workerTask)
+		result := worker.RunTask()
+
+		if result.Error != nil {
+			valueStream <- UpdateValue{Error: fmt.Errorf(workerName+": ", result.Error)}
+			return
+		}
+
+		workerTask.ContainerID = result.ContainerId
+		valueStream <- UpdateValue{Update: fmt.Sprintf("%s: task %s is running in container %s\n", workerName, workerTask.ID, workerTask.ContainerID)}
+		valueStream <- UpdateValue{Update: fmt.Sprintf("%s: Sleepy time\n", workerName)}
+		time.Sleep(time.Second * time.Duration(sleepTimeSecs))
+
+		valueStream <- UpdateValue{Update: fmt.Sprintf("%s: stopping task %s\n", workerName, workerTask.ID)}
+
+		workerTask.State = task.Completed
+		worker.AddTask(workerTask)
+		result = worker.RunTask()
+
+		if result.Error != nil {
+			valueStream <- UpdateValue{Error: fmt.Errorf(workerName+": ", result.Error)}
+		}
+
+	})
+
+	go func() {
+		defer close(valueStream)
+		wg.Wait()
+	}()
+	return valueStream
+
 }

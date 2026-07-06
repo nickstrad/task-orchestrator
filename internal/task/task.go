@@ -3,10 +3,11 @@ package task
 import (
 	"fmt"
 	"runtime/debug"
+	"slices"
 	"time"
 
-	"github.com/docker/go-connections/nat"
 	"github.com/google/uuid"
+	"github.com/moby/moby/api/types/network"
 )
 
 type State int
@@ -19,6 +20,47 @@ const (
 	Failed
 )
 
+type StateMachine struct {
+	machine map[State][]State
+}
+
+func NewStateMachine() StateMachine {
+	return StateMachine{
+		machine: map[State][]State{
+			Pending:   {Scheduled},
+			Scheduled: {Scheduled, Running, Failed},
+			Running:   {Running, Completed, Failed},
+			Completed: {},
+			Failed:    {},
+		},
+	}
+}
+
+func (s *StateMachine) IsValidTransition(cur, next State) bool {
+	if validStates, exists := s.machine[cur]; exists && slices.Contains(validStates, next) {
+		return true
+	}
+
+	return false
+}
+
+func (s State) String() string {
+	switch s {
+	case Pending:
+		return "Pending"
+	case Scheduled:
+		return "Scheduled"
+	case Running:
+		return "Running"
+	case Completed:
+		return "Completed"
+	case Failed:
+		return "Failed"
+	default:
+		return ""
+	}
+}
+
 type Task struct {
 	Name          string
 	ID            uuid.UUID
@@ -26,11 +68,28 @@ type Task struct {
 	Image         string
 	Memory        int
 	Disk          int
-	ExposedPorts  nat.PortSet
+	ExposedPorts  network.PortSet
 	PortBindings  map[string]string
 	RestartPolicy string
 	StartTime     time.Time
 	FinishTime    time.Time
+	ContainerID   string
+}
+
+type Config struct {
+	Name          string
+	AttachStdin   bool
+	AttachStdout  bool
+	AttachStderr  bool
+	ExposedPorts  network.PortSet
+	ContainerID   string
+	Cmd           []string
+	Image         string
+	Cpu           float64
+	Memory        int64
+	Disk          int64
+	Env           []string
+	RestartPolicy string
 }
 
 type TaskEvent struct {
@@ -47,7 +106,7 @@ type TaskError struct {
 	Misc       map[string]interface{}
 }
 
-func wrapError(err error, messagef string, msgArgs ...interface{}) *TaskError {
+func WrapError(err error, messagef string, msgArgs ...interface{}) *TaskError {
 	return &TaskError{
 		Inner:      err,
 		Message:    fmt.Sprintf(messagef, msgArgs...),
