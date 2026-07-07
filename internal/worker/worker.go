@@ -126,4 +126,13 @@ func (w *Worker) AddTask(t task.Task) {
 	w.Queue.Enqueue(t)
 }
 
+func (w *Worker) GetTasks() []task.Task {
+	tasks := make([]task.Task, 0, len(w.Db))
+	for _, value := range w.Db {
+		tasks = append(tasks, *value)
+	}
+
+	return tasks
+}
+
 func (w *Worker) CollectStats() {}
