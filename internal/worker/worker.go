@@ -24,6 +24,7 @@ type Worker struct {
 	Db        map[uuid.UUID]*task.Task
 	Queue     queue.Queue
 	TaskCount int
+	Stats     *Stats
 }
 
 func NewWorker(name string) Worker {
@@ -31,6 +32,19 @@ func NewWorker(name string) Worker {
 		Name:  name,
 		Db:    make(map[uuid.UUID]*task.Task),
 		Queue: *queue.New(),
+	}
+}
+
+func (w *Worker) CollectStats(done <-chan struct{}) {
+	for {
+		select {
+		case <-done:
+		default:
+		}
+		log.Println("Collecting Stats")
+		w.Stats = NewStats()
+		w.Stats.TaskCount = w.TaskCount
+		time.Sleep(time.Second * 15)
 	}
 }
 
@@ -134,5 +148,3 @@ func (w *Worker) GetTasks() []task.Task {
 
 	return tasks
 }
-
-func (w *Worker) CollectStats() {}

@@ -27,7 +27,7 @@ func main() {
 
 	})
 
-	for i := range 3 {
+	for i := range 1 {
 		wg.Add(1)
 		go func(workerNum int) {
 			defer wg.Done()
@@ -66,6 +66,7 @@ func doWork(done <-chan struct{}, workerNum int) <-chan UpdateValue {
 
 	fmt.Printf("%s listenining on %s:%d\n", workerName, host, port)
 	w := worker.NewWorker(workerName)
+	go w.CollectStats(done)
 	api := worker.NewAPI(&w, host, port)
 
 	runTasks := func() {

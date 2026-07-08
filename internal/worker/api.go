@@ -112,6 +112,12 @@ func (a *API) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
 
 }
 
+func (a *API) GetStatsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	json.NewEncoder(w).Encode(a.Worker.Stats)
+}
+
 func (a *API) initRouter() {
 	a.Router = chi.NewRouter()
 	a.Router.Route("/tasks", func(r chi.Router) {
@@ -120,6 +126,10 @@ func (a *API) initRouter() {
 		r.Route("/{taskID}", func(r chi.Router) {
 			r.Delete("/", a.StopTaskHandler)
 		})
+	})
+	a.Router.Route("/stats", func(r chi.Router) {
+		r.Get("/", a.GetStatsHandler)
+
 	})
 	server := &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", a.Address, a.Port),
