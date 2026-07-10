@@ -25,10 +25,6 @@ type ErrorResponse struct {
 	Code    int    `json:"code"`
 }
 
-type Response struct {
-	Message string `json:"message"`
-}
-
 func NewAPI(worker *Worker, host string, port int) API {
 	return API{
 		Address: host,
@@ -45,7 +41,7 @@ func (a *API) StartTaskHandler(w http.ResponseWriter, r *http.Request) {
 
 	taskEvent := task.TaskEvent{}
 	if err := d.Decode(&taskEvent); err != nil {
-		msg := fmt.Sprintf("Error unmarshalling bodh: %v\n", err)
+		msg := fmt.Sprintf("Error unmarshalling body: %v\n", err)
 		log.Println(msg)
 		w.WriteHeader(400)
 		e := ErrorResponse{
@@ -98,15 +94,16 @@ func (a *API) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	taskToStop := a.Worker.Db[parsedTaskID]
-	taskCopy := *taskToStop
+	taskCopy := taskToStop
 	taskCopy.State = task.Completed
 	a.Worker.AddTask(taskCopy)
 
 	msg := fmt.Sprintf("Added task %v to stop container %v\n", taskToStop.ID, taskToStop.ContainerID)
 	log.Println(msg)
 	w.WriteHeader(204)
-	e := Response{
+	e := ErrorResponse{
 		Message: msg,
+		Code:    204,
 	}
 	json.NewEncoder(w).Encode(e)
 
