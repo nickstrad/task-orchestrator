@@ -1,4 +1,4 @@
-package worker
+package manager
 
 import (
 	"context"
@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -15,53 +16,42 @@ import (
 type API struct {
 	Address string
 	Port    int
-	Worker  *Worker
 	Router  *chi.Mux
 	Server  *http.Server
+	Manager Manager
 }
 
-type ErrorResponse struct {
-	Message string `json:"message"`
-	Code    int    `json:"code"`
-}
-
-func NewAPI(worker *Worker, host string, port int) API {
+func NewAPI(host string, port int, manager Manager) API {
 	return API{
 		Address: host,
 		Port:    port,
-		Worker:  worker,
+		Manager: manager,
 	}
 }
 
 func (a *API) StartTaskHandler(w http.ResponseWriter, r *http.Request) {
 	d := json.NewDecoder(r.Body)
 	d.DisallowUnknownFields()
-
 	w.Header().Set("Content-Type", "application/json")
 
 	taskEvent := task.TaskEvent{}
+
 	if err := d.Decode(&taskEvent); err != nil {
 		msg := fmt.Sprintf("Error unmarshalling body: %v\n", err)
 		log.Println(msg)
 		w.WriteHeader(400)
 		e := ErrorResponse{
-			Code:    500,
+			Code:    400,
 			Message: msg,
 		}
 		json.NewEncoder(w).Encode(e)
 		return
 	}
 
-	a.Worker.AddTask(taskEvent.Task)
-	log.Printf("Added task %v\n", taskEvent.Task.ID)
+	a.Manager.AddTask(taskEvent)
+	fmt.Printf("Added task: %s\n", taskEvent.Task.ID)
 	w.WriteHeader(201)
-	json.NewEncoder(w).Encode(taskEvent.Task)
-}
-
-func (a *API) GetTasksHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(200)
-	json.NewEncoder(w).Encode(a.Worker.GetTasks())
+	json.NewEncoder(w).Encode(taskEvent)
 }
 
 func (a *API) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
@@ -71,48 +61,44 @@ func (a *API) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
 		log.Println(msg)
 		w.WriteHeader(400)
 		e := ErrorResponse{
-			Code:    500,
+			Code:    400,
 			Message: msg,
 		}
 		json.NewEncoder(w).Encode(e)
 		return
 	}
-
 	parsedTaskID, _ := uuid.Parse(taskID)
 
-	_, ok := a.Worker.Db[parsedTaskID]
-	if !ok {
+	t, exists := a.Manager.TaskDb[parsedTaskID]
+	if !exists {
 		msg := "task does not exist on worker"
 		log.Println(msg)
 		e := ErrorResponse{
-			Code:    500,
+			Code:    404,
 			Message: msg,
 		}
 		w.WriteHeader(404)
 		json.NewEncoder(w).Encode(e)
 		return
 	}
-
-	taskToStop := a.Worker.Db[parsedTaskID]
-	taskCopy := taskToStop
-	taskCopy.State = task.Completed
-	a.Worker.AddTask(taskCopy)
-
-	msg := fmt.Sprintf("Added task %v to stop container %v\n", taskToStop.ID, taskToStop.ContainerID)
-	log.Println(msg)
-	w.WriteHeader(204)
-	e := ErrorResponse{
-		Message: msg,
-		Code:    204,
+	tCopy := *t
+	tCopy.State = task.Completed
+	te := task.TaskEvent{
+		ID:        uuid.New(),
+		Task:      tCopy,
+		State:     task.Completed,
+		Timestamp: time.Now(),
 	}
-	json.NewEncoder(w).Encode(e)
 
+	a.Manager.AddTask(te)
+	fmt.Printf("Scheduled task %s to be deleted with task event %s\n", t.ID, te.ID)
+	w.WriteHeader(204)
 }
 
-func (a *API) GetStatsHandler(w http.ResponseWriter, r *http.Request) {
+func (a *API) GetTasksHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(200)
-	json.NewEncoder(w).Encode(a.Worker.Stats)
+	json.NewEncoder(w).Encode(a.Manager.GetTasks())
 }
 
 func (a *API) initRouter() {
@@ -124,10 +110,7 @@ func (a *API) initRouter() {
 			r.Delete("/", a.StopTaskHandler)
 		})
 	})
-	a.Router.Route("/stats", func(r chi.Router) {
-		r.Get("/", a.GetStatsHandler)
 
-	})
 	server := &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", a.Address, a.Port),
 		Handler: a.Router,

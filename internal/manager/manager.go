@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/golang-collections/collections/queue"
 	"github.com/google/uuid"
@@ -69,7 +70,33 @@ func (m *Manager) SelectWorker() string {
 	return m.Workers[m.LastWorker]
 }
 
-func (m *Manager) UpdateTasks() {
+func (m *Manager) UpdateTasks(done <-chan struct{}) {
+	for {
+		select {
+		case <-done:
+			return
+		case <-time.After(15 * time.Second):
+			fmt.Println("updating tasks")
+			m.updateTasks()
+			fmt.Println("sleeping for 15 seconds")
+		}
+	}
+}
+
+func (m *Manager) ProcessTasks(done <-chan struct{}) {
+	for {
+		select {
+		case <-done:
+			return
+		case <-time.After(10 * time.Second):
+			fmt.Println("delegating tasks to workers")
+			m.SendWork()
+			fmt.Println("sleeping for 10 seconds")
+		}
+	}
+}
+
+func (m *Manager) updateTasks() {
 	for _, worker := range m.Workers {
 		log.Printf("Checking worker %v for task updates", worker)
 		workerID := m.WorkerNameToID[worker]
@@ -169,4 +196,12 @@ func (m *Manager) SendWork() {
 
 func (m *Manager) AddTask(taskEvent task.TaskEvent) {
 	m.Pending.Enqueue(taskEvent)
+}
+
+func (m *Manager) GetTasks() []task.Task {
+	tasks := []task.Task{}
+	for _, task := range m.TaskDb {
+		tasks = append(tasks, *task)
+	}
+	return tasks
 }

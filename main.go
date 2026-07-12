@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -19,19 +22,20 @@ func main() {
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
+	totalWorkers := 1
+	mHost := "localhost"
+	mPort := 3000 + totalWorkers + 1
+	mAddr := fmt.Sprintf("http://%s:%d", mHost, mPort)
+	workerStream := make(chan manager.WorkerMetadata)
 	var wg sync.WaitGroup
 	done := make(chan struct{})
 
 	wg.Go(func() {
 		defer close(done)
 		sig := <-sigChan
-		fmt.Printf("\nReceived signal: %v. Cleaning up...\n", sig)
-
+		fmt.Printf("\nmain process: Received signal: %v. Cleaning up...\n", sig)
 	})
 
-	totalWorkers := 1
-	workerStream := make(chan manager.WorkerMetadata)
 	for i := range totalWorkers {
 		wg.Add(1)
 		go func(workerNum int) {
@@ -45,10 +49,10 @@ func main() {
 				default:
 				}
 				if v.Error != nil {
-					fmt.Printf("%v", v.Error)
+					fmt.Printf("worker-%d: %v\n", workerNum, v.Error)
 					continue
 				}
-				fmt.Println(v.Update)
+				fmt.Printf("worker-%d: %v", workerNum, v.Update)
 			}
 		}(i)
 	}
@@ -64,7 +68,16 @@ func main() {
 			workers = append(workers, <-workerStream)
 		}
 		m := manager.NewManager(workers)
+		api := manager.NewAPI(mHost, mPort, *m)
+		go api.Start(done)
+		go api.Manager.UpdateTasks(done)
+		go api.Manager.ProcessTasks(done)
+		fmt.Printf("Manager listening on: %s\n", mAddr)
+		defer api.Stop()
+		<-done
+	})
 
+	wg.Go(func() {
 		for i := range totalWorkers {
 			select {
 			case <-done:
@@ -82,17 +95,33 @@ func main() {
 				State: task.Running,
 				Task:  t,
 			}
-			m.AddTask(te)
-			m.SendWork()
-		}
-		for {
-			select {
-			case <-done:
-				return
-			case <-time.After(time.Second * 10):
-				m.UpdateTasks()
+			data, err := json.Marshal(te)
 
+			if err != nil {
+				log.Printf("main process: Unable to marshal task object: %v.\n", t)
+				continue
 			}
+
+			fmt.Println("main process: sending task to manager!")
+			resp, err := http.Post(fmt.Sprintf("%s/tasks", mAddr), "application/json", bytes.NewBuffer(data))
+			if err != nil {
+				fmt.Println(fmt.Errorf("main process: error sending task to manager %v", err))
+				continue
+			}
+
+			fmt.Printf("main process: %v\n", resp.Body)
+			d := json.NewDecoder(resp.Body)
+
+			respTaskEvent := task.TaskEvent{}
+
+			if err := d.Decode(&respTaskEvent); err != nil {
+				fmt.Println(fmt.Errorf("%s: Error unmarshalling body: %v\n", mAddr, err))
+				continue
+			}
+
+			fmt.Printf("main process: resp from manager: %v\n", respTaskEvent)
+			fmt.Println("main process: sleeping for 3 seconds")
+			time.Sleep(3 * time.Second)
 		}
 	})
 
@@ -112,38 +141,25 @@ func doWork(done <-chan struct{}, workerNum int) (<-chan UpdateValue, manager.Wo
 	host := "localhost"
 	port := 3000 + workerNum
 
-	fmt.Printf("%s listenining on %s:%d\n", workerName, host, port)
+	workerAddr := fmt.Sprintf("http://%s:%d", host, port)
+	fmt.Printf("%s listenining on %s\n", workerName, workerAddr)
 	w := worker.NewWorker(workerName, workerNum)
 	go w.CollectStats(done)
 	api := worker.NewAPI(&w, host, port)
 	wg.Go(func() {
-		api.Start()
+		fmt.Printf("%s: starting server \n", workerAddr)
+		api.Start(done)
 	})
 
 	wg.Go(func() {
-		for {
-			select {
-			case <-done:
-				api.Stop()
-				return
-			case <-time.After(10 * time.Second):
-			}
-			if w.Queue.Len() != 0 {
-				result := w.RunTask()
-				if result.Error != nil {
-					log.Printf("Error running task: %v\n", result.Error)
-				}
-			} else {
-				log.Println("No tasks to process currently.")
-			}
-			log.Println("Sleeping for 10 seconds")
-
-		}
+		fmt.Printf("%s: starting run tasks \n", workerAddr)
+		w.RunTasks(done)
 	})
 
 	go func() {
 		defer close(valueStream)
 		wg.Wait()
+		fmt.Printf("%s: cleaning up closing value stream \n", workerAddr)
 	}()
 
 	return valueStream, manager.WorkerMetadata{Name: workerName, ID: workerNum}

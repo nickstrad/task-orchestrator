@@ -41,6 +41,7 @@ func (w *Worker) CollectStats(done <-chan struct{}) {
 	for {
 		select {
 		case <-done:
+			return
 		default:
 		}
 		log.Println("Collecting Stats")
@@ -148,4 +149,23 @@ func (w *Worker) GetTasks() []task.Task {
 	}
 
 	return tasks
+}
+
+func (w *Worker) RunTasks(done <-chan struct{}) {
+	for {
+		select {
+		case <-done:
+			return
+		case <-time.After(10 * time.Second):
+		}
+		if w.Queue.Len() != 0 {
+			result := w.RunTask()
+			if result.Error != nil {
+				log.Printf("Error running task: %v\n", result.Error)
+			}
+		} else {
+			log.Println("No tasks to process currently.")
+		}
+		log.Println("Sleeping for 10 seconds")
+	}
 }
