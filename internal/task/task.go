@@ -70,10 +70,13 @@ type Task struct {
 	Disk          int
 	ExposedPorts  network.PortSet
 	PortBindings  map[string]string
+	HostPorts     network.PortMap
 	RestartPolicy string
 	StartTime     time.Time
 	FinishTime    time.Time
 	ContainerID   string
+	HealthCheck   string
+	RestartCount  int
 }
 
 type Config struct {

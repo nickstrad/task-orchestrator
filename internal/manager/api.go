@@ -81,7 +81,7 @@ func (a *API) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(e)
 		return
 	}
-	tCopy := *t
+	tCopy := t
 	tCopy.State = task.Completed
 	te := task.TaskEvent{
 		ID:        uuid.New(),

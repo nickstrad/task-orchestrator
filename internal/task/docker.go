@@ -24,6 +24,11 @@ type DockerResult struct {
 	Result      string
 }
 
+type DockerInspectResponse struct {
+	Error     error
+	Container *client.ContainerInspectResult
+}
+
 func NewDocker(config Config) *Docker {
 	dockerClient, _ := client.New(client.FromEnv)
 	return &Docker{
@@ -151,4 +156,17 @@ func (d *Docker) Stop(id string) DockerResult {
 	}
 
 	return NewDockerResult(nil, "stop", id, "success")
+}
+
+func (d *Docker) Inspect(containerID string) DockerInspectResponse {
+	ctx := context.Background()
+	containerInspectOptions := client.ContainerInspectOptions{}
+	resp, err := d.Client.ContainerInspect(ctx, containerID, containerInspectOptions)
+
+	if err != nil {
+		log.Printf("Error inspecting container: %s\n", err)
+		return DockerInspectResponse{Error: err}
+	}
+
+	return DockerInspectResponse{Container: &resp}
 }

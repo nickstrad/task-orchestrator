@@ -22,7 +22,7 @@ func main() {
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	totalWorkers := 1
+	totalWorkers := 2
 	mHost := "localhost"
 	mPort := 3000 + totalWorkers + 1
 	mAddr := fmt.Sprintf("http://%s:%d", mHost, mPort)
@@ -71,6 +71,7 @@ func main() {
 		api := manager.NewAPI(mHost, mPort, *m)
 		go api.Start(done)
 		go api.Manager.UpdateTasks(done)
+		go api.Manager.DoHealthChecks(done)
 		go api.Manager.ProcessTasks(done)
 		fmt.Printf("Manager listening on: %s\n", mAddr)
 		defer api.Stop()
@@ -78,17 +79,27 @@ func main() {
 	})
 
 	wg.Go(func() {
-		for i := range totalWorkers {
+		tasks := []task.Task{
+			{
+				ID:          uuid.New(),
+				Name:        "echo-healthy",
+				State:       task.Scheduled,
+				Image:       "timboring/echo-server:latest",
+				HealthCheck: "/health",
+			},
+			{
+				ID:          uuid.New(),
+				Name:        "echo-healthfail",
+				State:       task.Scheduled,
+				Image:       "timboring/echo-server:latest",
+				HealthCheck: "/healthfail",
+			},
+		}
+		for _, t := range tasks {
 			select {
 			case <-done:
 				return
 			default:
-			}
-			t := task.Task{
-				ID:    uuid.New(),
-				Name:  fmt.Sprintf("test-container-%d", i),
-				State: task.Scheduled,
-				Image: "strm/helloworld-http",
 			}
 			te := task.TaskEvent{
 				ID:    uuid.New(),
@@ -162,6 +173,6 @@ func doWork(done <-chan struct{}, workerNum int) (<-chan UpdateValue, manager.Wo
 		fmt.Printf("%s: cleaning up closing value stream \n", workerAddr)
 	}()
 
-	return valueStream, manager.WorkerMetadata{Name: workerName, ID: workerNum}
+	return valueStream, manager.WorkerMetadata{Name: workerName, ID: workerNum, Address: workerAddr}
 
 }

@@ -7,8 +7,8 @@ import (
 	"runtime/debug"
 	"time"
 
-	"github.com/golang-collections/collections/queue"
 	"github.com/google/uuid"
+	"github.com/nickstrad/task-orchestrator/internal/queue"
 	"github.com/nickstrad/task-orchestrator/internal/task"
 )
 
@@ -23,7 +23,7 @@ type Worker struct {
 	Name      string
 	ID        int
 	Db        map[uuid.UUID]task.Task
-	Queue     queue.Queue
+	Queue     *queue.Queue[task.Task]
 	TaskCount int
 	Stats     *Stats
 }
@@ -33,7 +33,7 @@ func NewWorker(name string, id int) Worker {
 		Name:  name,
 		ID:    id,
 		Db:    make(map[uuid.UUID]task.Task),
-		Queue: *queue.New(),
+		Queue: queue.New[task.Task](),
 	}
 }
 
@@ -61,15 +61,13 @@ func WrapError(err error, messagef string, msgArgs ...interface{}) *WorkerError 
 }
 
 func (w *Worker) RunTask() task.DockerResult {
-	t := w.Queue.Dequeue()
-	if t == nil {
+	taskQueued, ok := w.Queue.Dequeue()
+	if !ok {
 		errMsg := "No tasks in the queue."
 		err := task.WrapError(errors.New(errMsg), "%s", errMsg)
 		log.Println(err)
 		return task.NewDockerResult(err, "", "", "")
 	}
-
-	taskQueued := t.(task.Task)
 
 	taskPersisted, exists := w.Db[taskQueued.ID]
 
@@ -167,5 +165,43 @@ func (w *Worker) RunTasks(done <-chan struct{}) {
 			log.Println("No tasks to process currently.")
 		}
 		log.Println("Sleeping for 10 seconds")
+	}
+}
+
+func (w *Worker) InspectTask(t task.Task) task.DockerInspectResponse {
+	config := task.NewConfig(t)
+	d := task.NewDocker(config)
+	return d.Inspect(t.ContainerID)
+}
+
+func (w *Worker) UpdateTasks() {
+	for {
+		log.Println("checking status of tasks")
+		w.updateTasks()
+		log.Println("Task updates completed")
+		log.Println("sleeping for 15 seconds")
+		time.Sleep(15 * time.Second)
+	}
+}
+
+func (w *Worker) updateTasks() {
+	for id, t := range w.Db {
+		if t.State != task.Running {
+			continue
+		}
+
+		resp := w.InspectTask(t)
+		if resp.Error != nil {
+			fmt.Printf("Error: %v\n", resp.Error)
+		} else if resp.Container == nil {
+			log.Printf("No container for running task %s\n", id)
+			t.State = task.Failed
+		} else if resp.Container.Container.State.Status == "exited" {
+			log.Printf("container for task %s in non-running state %s", id, resp.Container.Container.State.Status)
+			t.State = task.Failed
+		}
+
+		t.HostPorts = resp.Container.Container.NetworkSettings.Ports
+		w.Db[id] = t
 	}
 }
