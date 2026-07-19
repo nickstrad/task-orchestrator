@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/moby/moby/api/types/network"
 	"github.com/nickstrad/task-orchestrator/internal/manager"
 	"github.com/nickstrad/task-orchestrator/internal/scheduler"
 	"github.com/nickstrad/task-orchestrator/internal/task"
@@ -84,44 +85,28 @@ func main() {
 	})
 
 	wg.Go(func() {
-		tasks := []task.Task{
-			{
-				ID:          uuid.New(),
-				Name:        "echo-healthy",
-				State:       task.Scheduled,
-				Image:       "timboring/echo-server:latest",
-				HealthCheck: "/health",
-			},
-			{
-				ID:          uuid.New(),
-				Name:        "echo-healthfail",
-				State:       task.Scheduled,
-				Image:       "timboring/echo-server:latest",
-				HealthCheck: "/healthfail",
-			},
+		taskEvents := []task.TaskEvent{
+			newEchoServerTaskEvent("echo-healthy", "/health"),
+			newEchoServerTaskEvent("echo-healthfail", "/healthfail"),
 		}
-		for _, t := range tasks {
+		for _, te := range taskEvents {
 			select {
 			case <-done:
 				return
 			default:
 			}
-			te := task.TaskEvent{
-				ID:    uuid.New(),
-				State: task.Running,
-				Task:  t,
-			}
+			taskID := te.Task.ID
 			data, err := json.Marshal(te)
 
 			if err != nil {
-				mainLogger.Error("unable to marshal task object", "err", err, "taskID", t.ID)
+				mainLogger.Error("unable to marshal task object", "err", err, "taskID", taskID)
 				continue
 			}
 
-			mainLogger.Info("sending task to manager", "taskID", t.ID)
+			mainLogger.Info("sending task to manager", "taskID", taskID)
 			resp, err := http.Post(fmt.Sprintf("%s/tasks", mAddr), "application/json", bytes.NewBuffer(data))
 			if err != nil {
-				mainLogger.Error("sending task to manager failed", "err", err, "taskID", t.ID)
+				mainLogger.Error("sending task to manager failed", "err", err, "taskID", taskID)
 				continue
 			}
 
@@ -142,6 +127,41 @@ func main() {
 	})
 
 	wg.Wait()
+}
+
+// The demo workload below is specific to timboring/echo-server. Everything the
+// orchestrator itself needs is on task.Task; these helpers only exist so the
+// image's quirks live in one place instead of being copied into each literal.
+const (
+	echoServerImage = "timboring/echo-server:latest"
+
+	// The image declares no EXPOSE, so PublishAllPorts (see task.Docker.Run) has
+	// nothing to publish unless the task declares the port itself. Without this
+	// the container starts fine but gets no host port, so every health check
+	// fails with "no host port found" and the manager restarts it on a loop.
+	echoServerPort = "7777/tcp"
+)
+
+// newEchoServerTask builds a Scheduled echo-server task probing healthCheck.
+func newEchoServerTask(name, healthCheck string) task.Task {
+	return task.Task{
+		ID:           uuid.New(),
+		Name:         name,
+		State:        task.Scheduled,
+		Image:        echoServerImage,
+		ExposedPorts: network.PortSet{network.MustParsePort(echoServerPort): struct{}{}},
+		HealthCheck:  healthCheck,
+	}
+}
+
+// newEchoServerTaskEvent wraps newEchoServerTask in the Running event the
+// manager's /tasks endpoint expects.
+func newEchoServerTaskEvent(name, healthCheck string) task.TaskEvent {
+	return task.TaskEvent{
+		ID:    uuid.New(),
+		State: task.Running,
+		Task:  newEchoServerTask(name, healthCheck),
+	}
 }
 
 type UpdateValue struct {

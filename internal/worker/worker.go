@@ -87,6 +87,16 @@ func (w *Worker) StartTask(t task.Task) task.DockerResult {
 		w.Db[t.ID] = t
 		return task.NewDockerResult(Wrap("worker.StartTask", "creating docker handler", err), "", "", "")
 	}
+
+	if t.ContainerID != "" {
+		dockerResult := dockerHandler.Stop(t.ContainerID)
+		if dockerResult.Error != nil {
+			t.State = task.Failed
+			w.Db[t.ID] = t
+			return task.NewDockerResult(Wrap("worker.StartTask", fmt.Sprintf("stopping existing container %s for task %s", t.ContainerID, t.ID), dockerResult.Error), "", "", "")
+		}
+	}
+
 	result := dockerHandler.Run()
 
 	if result.Error != nil {
@@ -94,6 +104,20 @@ func (w *Worker) StartTask(t task.Task) task.DockerResult {
 		w.Db[t.ID] = t
 		result.Error = Wrap("worker.StartTask", fmt.Sprintf("starting task %s", t.ID), result.Error)
 		return result
+	}
+
+	if result.Result == "success" {
+		inspectResult := dockerHandler.Inspect(result.ContainerId)
+		if inspectResult.Error != nil {
+			t.State = task.Failed
+			w.Db[t.ID] = t
+			result.Error = Wrap("worker.StartTask", fmt.Sprintf("inspecting container %s for task %s", result.ContainerId, t.ID), inspectResult.Error)
+			return result
+		}
+
+		if inspectResult.Container.Container.NetworkSettings.Ports != nil {
+			t.HostPorts = inspectResult.Container.Container.NetworkSettings.Ports
+		}
 	}
 
 	t.ContainerID = result.ContainerId

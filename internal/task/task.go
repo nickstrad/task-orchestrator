@@ -27,9 +27,9 @@ func NewStateMachine() StateMachine {
 		machine: map[State][]State{
 			Pending:   {Scheduled},
 			Scheduled: {Scheduled, Running, Failed},
-			Running:   {Running, Completed, Failed},
+			Running:   {Running, Completed, Failed, Scheduled},
 			Completed: {},
-			Failed:    {},
+			Failed:    {Scheduled},
 		},
 	}
 }
@@ -67,7 +67,6 @@ type Task struct {
 	Memory        int
 	Disk          int
 	ExposedPorts  network.PortSet
-	PortBindings  map[string]string
 	HostPorts     network.PortMap
 	RestartPolicy string
 	StartTime     time.Time

@@ -6,11 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/moby/moby/api/types/network"
 	"github.com/nickstrad/task-orchestrator/internal/httpapi"
 	"github.com/nickstrad/task-orchestrator/internal/node"
 	"github.com/nickstrad/task-orchestrator/internal/queue"
@@ -37,10 +35,6 @@ type Manager struct {
 	logger              *slog.Logger
 }
 
-func getWorkerUrl(workerNum int) string {
-	return fmt.Sprintf("http://localhost:%d", 3000+workerNum)
-}
-
 type WorkerMetadata struct {
 	Name    string
 	ID      int
@@ -65,17 +59,18 @@ func NewManager(workers []WorkerMetadata, schedulerType string, logger *slog.Log
 	s := scheduler.GetScheduler(schedulerType)
 
 	return &Manager{
-		LastWorker:     0,
-		Pending:        queue.New[task.TaskEvent](),
-		TaskDb:         make(map[uuid.UUID]task.Task),
-		EventDb:        make(map[uuid.UUID]task.TaskEvent),
-		Workers:        workerNames,
-		WorkerNameToID: workerNameToID,
-		WorkerTaskMap:  workerTaskMap,
-		TaskWorkerMap:  make(map[uuid.UUID]string),
-		Scheduler:      s,
-		WorkerNodes:    nodes,
-		logger:         logger,
+		LastWorker:          0,
+		Pending:             queue.New[task.TaskEvent](),
+		TaskDb:              make(map[uuid.UUID]task.Task),
+		EventDb:             make(map[uuid.UUID]task.TaskEvent),
+		Workers:             workerNames,
+		WorkerNameToID:      workerNameToID,
+		WorkerTaskMap:       workerTaskMap,
+		WorkerNameToAddress: workerNameToAddress,
+		TaskWorkerMap:       make(map[uuid.UUID]string),
+		Scheduler:           s,
+		WorkerNodes:         nodes,
+		logger:              logger,
 	}
 }
 
@@ -119,46 +114,50 @@ func (m *Manager) ProcessTasks(done <-chan struct{}) {
 
 func (m *Manager) updateTasks() {
 	for _, workerName := range m.Workers {
-		workerID := m.WorkerNameToID[workerName]
-		workerURL := getWorkerUrl(workerID)
-		m.logger.Debug("checking worker for task updates", "workerID", workerID, "url", workerURL)
-		url := fmt.Sprintf("%s/tasks", workerURL)
-		resp, err := http.Get(url)
-		if err != nil {
-			m.logger.Warn("connecting to worker failed",
-				"err", E("manager.updateTasks", "connecting to worker "+workerName, err),
-				"workerID", workerID)
-			continue
-		}
-		if resp.StatusCode != http.StatusOK {
-			m.logger.Warn("worker returned unexpected status",
-				"workerID", workerID, "code", resp.StatusCode)
+		// One worker per call, so the response body is closed as soon as we are
+		// done with it rather than piling up until every worker has been polled.
+		m.updateTasksFromWorker(workerName)
+	}
+}
+
+func (m *Manager) updateTasksFromWorker(workerName string) {
+	workerID := m.WorkerNameToID[workerName]
+	workerURL := m.WorkerNameToAddress[workerName]
+	m.logger.Debug("checking worker for task updates", "workerID", workerID, "url", workerURL)
+	url := workerTasksURL(workerURL)
+	resp, err := http.Get(url)
+	if err != nil {
+		m.logger.Warn("connecting to worker failed",
+			"err", E("manager.updateTasksFromWorker", "connecting to worker "+workerName, err),
+			"workerID", workerID)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		m.logger.Warn("worker returned unexpected status",
+			"workerID", workerID, "code", resp.StatusCode)
+		return
+	}
+
+	decoder := json.NewDecoder(resp.Body)
+	var tasks []task.Task
+	if err := decoder.Decode(&tasks); err != nil {
+		m.logger.Warn("unmarshalling tasks failed",
+			"err", E("manager.updateTasksFromWorker", "decoding task list", err),
+			"workerID", workerID)
+		return
+	}
+
+	for _, t := range tasks {
+		persisted, ok := m.TaskDb[t.ID]
+		if !ok {
+			// One unknown task must not abort updates for the remaining tasks.
+			m.logger.Warn("task not found in task db", "taskID", t.ID, "workerID", workerID)
 			continue
 		}
 
-		decoder := json.NewDecoder(resp.Body)
-		var tasks []task.Task
-		if err := decoder.Decode(&tasks); err != nil {
-			m.logger.Warn("unmarshalling tasks failed",
-				"err", E("manager.updateTasks", "decoding task list", err),
-				"workerID", workerID)
-			continue
-		}
-
-		for _, t := range tasks {
-			persisted, ok := m.TaskDb[t.ID]
-			if !ok {
-				// One unknown task must not abort updates for the remaining tasks.
-				m.logger.Warn("task not found in task db", "taskID", t.ID, "workerID", workerID)
-				continue
-			}
-
-			persisted.State = t.State
-			persisted.StartTime = t.StartTime
-			persisted.FinishTime = t.FinishTime
-			persisted.ContainerID = t.ContainerID
-			m.TaskDb[t.ID] = persisted
-		}
+		m.TaskDb[t.ID] = mergeTaskUpdate(persisted, t)
 	}
 }
 
@@ -194,8 +193,7 @@ func (m *Manager) SendWork() {
 		return
 	}
 
-	workerID := m.WorkerNameToID[workerName]
-	url := fmt.Sprintf("%s/tasks", getWorkerUrl(workerID))
+	url := workerTasksURL(m.WorkerNameToAddress[workerName])
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
 
 	if err != nil {
@@ -204,6 +202,7 @@ func (m *Manager) SendWork() {
 		m.Pending.Enqueue(taskEvent)
 		return
 	}
+	defer resp.Body.Close()
 
 	decoder := json.NewDecoder(resp.Body)
 
@@ -248,21 +247,33 @@ func (m *Manager) GetTasks() []task.Task {
 }
 
 func (m *Manager) checkTaskHealth(t task.Task) error {
-	w := m.TaskWorkerMap[t.ID]
+	workerName, exists := m.TaskWorkerMap[t.ID]
+
+	if !exists {
+		return E("manager.checkTaskHealth", fmt.Sprintf("no worker found for task %s", t.ID), nil)
+	}
 	hostPort, ok := getHostPort(t.HostPorts)
 	if !ok {
 		return E("manager.checkTaskHealth", fmt.Sprintf("no host port found for task %s", t.ID), nil)
 	}
 
-	// NOTE: the https:// scheme and the strings.Split on the worker name are
-	// pre-existing oddities, left alone deliberately (see the plan's non-goals).
-	worker := strings.Split(w, ":")
-	url := fmt.Sprintf("https://%s:%s%s", worker[0], hostPort, t.HealthCheck)
+	workerAddr, exists := m.WorkerNameToAddress[workerName]
+
+	if !exists {
+		return E("manager.checkTaskHealth", fmt.Sprintf("no worker address found for worker %s for %s", workerName, t.ID), nil)
+	}
+
+	url, err := healthCheckURL(workerAddr, hostPort, t.HealthCheck)
+	if err != nil {
+		return E("manager.checkTaskHealth", fmt.Sprintf("building health check url for task %s", t.ID), err)
+	}
 	m.logger.Debug("calling health check", "taskID", t.ID, "url", url)
 	resp, err := http.Get(url)
 	if err != nil {
 		return E("manager.checkTaskHealth", "connecting to health check "+url, err)
 	}
+
+	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		return E("manager.checkTaskHealth",
@@ -276,19 +287,16 @@ func (m *Manager) checkTaskHealth(t task.Task) error {
 
 func (m *Manager) doHealthChecks() {
 	for _, t := range m.GetTasks() {
-		if t.State != task.Running && t.State != task.Failed {
+		switch decideHealthAction(t) {
+		case healthSkipNotEligible:
 			m.logger.Debug("skipping health check: task not running or failed",
 				"taskID", t.ID, "state", t.State)
-			continue
-		}
 
-		if t.RestartCount >= TaskRestartMax {
+		case healthSkipRestartMax:
 			m.logger.Debug("skipping health check: restart max reached",
 				"taskID", t.ID, "restartCount", t.RestartCount)
-			continue
-		}
 
-		if t.State == task.Running {
+		case healthActionCheck:
 			// Terminal consumer for checkTaskHealth's error: log it once here.
 			err := m.checkTaskHealth(t)
 			if err == nil {
@@ -296,12 +304,9 @@ func (m *Manager) doHealthChecks() {
 			}
 			m.logger.Warn("health check failed, restarting task", "err", err, "taskID", t.ID)
 			m.restartTask(t)
-			continue
-		}
 
-		if t.State == task.Failed {
+		case healthActionRestart:
 			m.restartTask(t)
-			continue
 		}
 	}
 }
@@ -325,7 +330,7 @@ func (m *Manager) restartTask(t task.Task) {
 			"err", E("manager.restartTask", "marshalling task event", err), "taskID", t.ID)
 		return
 	}
-	url := fmt.Sprintf("%s/tasks", wAddress)
+	url := workerTasksURL(wAddress)
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
 	if err != nil {
 		m.logger.Warn("worker unreachable, requeueing task",
@@ -334,6 +339,8 @@ func (m *Manager) restartTask(t task.Task) {
 		m.Pending.Enqueue(te)
 		return
 	}
+
+	defer resp.Body.Close()
 
 	d := json.NewDecoder(resp.Body)
 	if resp.StatusCode != http.StatusCreated {
@@ -379,11 +386,4 @@ func (m *Manager) DoHealthChecks(done <-chan struct{}) {
 			work()
 		}
 	}
-}
-
-func getHostPort(ports network.PortMap) (string, bool) {
-	for k := range ports {
-		return ports[k][0].HostPort, true
-	}
-	return "", false
 }

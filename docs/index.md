@@ -12,6 +12,7 @@ Follow these when writing code.
 | Document | What it covers |
 | --- | --- |
 | [`error-handling-and-logging.md`](error-handling-and-logging.md) | **Read before writing any error or log line.** Per-package error types (`TaskError`/`WorkerError`/`ManagerError`), the `E`-at-the-boundary / `Wrap`-above-it rule, one-log-per-error, `slog` child loggers and attribute keys, and the `internal/httpapi` helpers for HTTP responses. |
+| [`code-structure-and-testing.md`](code-structure-and-testing.md) | How to split pure functions and business logic out of framework plumbing, when a buried block is worth extracting, and what to test at each layer. Table-driven test conventions and the `go build` / `go vet` / `gofmt` checks a change is expected to pass. |
 
 ## Reference — where the project could go next
 

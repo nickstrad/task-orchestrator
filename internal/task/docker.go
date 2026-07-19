@@ -131,6 +131,7 @@ func (d *Docker) Run() DockerResult {
 	}
 
 	stdcopy.StdCopy(os.Stdout, os.Stderr, out)
+
 	return NewDockerResult(nil, "start", containerCreateResp.ID, "success")
 }
 
