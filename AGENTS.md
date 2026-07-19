@@ -15,6 +15,11 @@ production software as fast as possible.
 
 ## Commits
 
+- **Never commit unless I explicitly ask you to.** Leave finished work in the working
+  tree and tell me what changed; I decide when it gets committed.
+- **Never merge to `main` unless I explicitly ask you to.** This includes fast-forwards
+  and merges of a plan's worktree branch.
+- Asking once does not stand as permission for later commits — wait for it each time.
 - **Do not add `Co-Authored-By:` trailers or any other AI attribution signature to commit
   messages.** Write the message as a plain description of the change.
 
