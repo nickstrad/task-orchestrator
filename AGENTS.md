@@ -13,6 +13,33 @@ production software as fast as possible.
 - Skeleton/incomplete code (e.g. stub functions, TODO-like fragments) is expected and often
   intentional work-in-progress — don't "complete" it on your own initiative.
 
+## Commits
+
+- **Do not add `Co-Authored-By:` trailers or any other AI attribution signature to commit
+  messages.** Write the message as a plain description of the change.
+
+## Worktrees
+
+When executing a plan, do the work in a git worktree rather than on `main`:
+
+```sh
+git worktree add .worktree/<branch-name> -b <branch-name> main
+```
+
+- Create every worktree inside **`.worktree/`** at the repo root. It is gitignored, so the
+  checkouts never show up as untracked files.
+- Name the branch after the plan being executed (e.g. `error-handling-and-logging`) and
+  give the worktree directory the same name.
+- **Clean up after merging to `main`** — a finished worktree left behind is a stale
+  checkout that will drift:
+
+  ```sh
+  git worktree remove .worktree/<branch-name>
+  git branch -d <branch-name>
+  ```
+
+  Use `git worktree list` to check for leftovers.
+
 ## Documentation
 
 All project documentation lives in [`docs/`](docs/). **Start at
