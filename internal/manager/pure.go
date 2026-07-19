@@ -45,7 +45,20 @@ func healthCheckURL(workerAddr, hostPort, healthCheckPath string) (string, error
 // mergeTaskUpdate returns persisted with the fields the worker owns copied over
 // from incoming. The manager owns everything else — notably RestartCount, which
 // the worker never sees and must not clobber.
+//
+// A worker's report is rejected outright when it would move the task along an
+// edge the state machine does not have. The case that matters is a retired
+// task: the manager marks it Completed as soon as the worker accepts the stop,
+// but the worker's own Db still says Running until its queue drains seconds
+// later. Completed is terminal, so that stale report cannot resurrect the task
+// into the health check loop. Same-state reports are the steady case and are
+// always allowed.
 func mergeTaskUpdate(persisted, incoming task.Task) task.Task {
+	sm := task.NewStateMachine()
+	if persisted.State != incoming.State && !sm.IsValidTransition(persisted.State, incoming.State) {
+		return persisted
+	}
+
 	persisted.State = incoming.State
 	persisted.StartTime = incoming.StartTime
 	persisted.FinishTime = incoming.FinishTime
