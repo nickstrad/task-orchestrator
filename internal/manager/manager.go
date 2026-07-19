@@ -124,7 +124,7 @@ func (m *Manager) updateTasksFromWorker(workerName string) {
 	workerID := m.WorkerNameToID[workerName]
 	workerURL := m.WorkerNameToAddress[workerName]
 	m.logger.Debug("checking worker for task updates", "workerID", workerID, "url", workerURL)
-	url := workerTasksURL(workerURL)
+	url := WorkerTasksURL(workerURL)
 	resp, err := http.Get(url)
 	if err != nil {
 		m.logger.Warn("connecting to worker failed",
@@ -174,6 +174,20 @@ func (m *Manager) SendWork() {
 	t := taskEvent.Task
 	m.logger.Debug("pulled task off pending queue", "taskID", t.ID)
 
+	taskWorker, ok := m.TaskWorkerMap[t.ID]
+	if ok {
+		m.logger.Debug("task already exists in task worker map", "taskID", t.ID)
+		stateMachine := task.NewStateMachine()
+		persistedTask := m.TaskDb[t.ID]
+		if t.State == task.Completed && stateMachine.IsValidTransition(persistedTask.State, t.State) {
+			m.stopTask(taskWorker, t.ID.String())
+			return
+		}
+		m.logger.Warn("ignoring invalid transition to completed",
+			"taskID", t.ID, "state", persistedTask.State, "requestedState", t.State)
+		return
+	}
+
 	node, err := m.SelectWorker(taskEvent.Task)
 	if err != nil {
 		m.logger.Error("selecting worker failed", "err", err, "taskID", t.ID)
@@ -193,7 +207,7 @@ func (m *Manager) SendWork() {
 		return
 	}
 
-	url := workerTasksURL(m.WorkerNameToAddress[workerName])
+	url := WorkerTasksURL(m.WorkerNameToAddress[workerName])
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
 
 	if err != nil {
@@ -330,7 +344,7 @@ func (m *Manager) restartTask(t task.Task) {
 			"err", E("manager.restartTask", "marshalling task event", err), "taskID", t.ID)
 		return
 	}
-	url := workerTasksURL(wAddress)
+	url := WorkerTasksURL(wAddress)
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
 	if err != nil {
 		m.logger.Warn("worker unreachable, requeueing task",
@@ -363,6 +377,53 @@ func (m *Manager) restartTask(t task.Task) {
 		return
 	}
 	m.logger.Info("task restarted", "taskID", newTask.ID, "restartCount", t.RestartCount)
+}
+
+func (m *Manager) stopTask(worker string, taskID string) {
+	workerAddr, exists := m.WorkerNameToAddress[worker]
+	if !exists {
+		m.logger.Error("stopping task failed",
+			"err", E("manager.stopTask", fmt.Sprintf("no worker address found for worker %s", worker), nil),
+			"taskID", taskID)
+		return
+	}
+
+	url := fmt.Sprintf("%s/%s", WorkerTasksURL(workerAddr), taskID)
+	req, err := http.NewRequest(http.MethodDelete, url, nil)
+	if err != nil {
+		m.logger.Error("building stop request failed",
+			"err", E("manager.stopTask", fmt.Sprintf("building delete request for task %s", taskID), err),
+			"taskID", taskID, "addr", workerAddr)
+		return
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		m.logger.Error("worker unreachable, task not stopped",
+			"err", E("manager.stopTask", "connecting to worker "+worker, err),
+			"taskID", taskID, "addr", workerAddr)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		// The worker's Go error never crosses the wire — all we get is a DTO.
+		// Log what it said, then mint a fresh error of our own rather than
+		// pretending to wrap one we do not have.
+		e := httpapi.ErrorResponse{}
+		if err := json.NewDecoder(resp.Body).Decode(&e); err != nil {
+			m.logger.Error("decoding worker error response failed",
+				"err", E("manager.stopTask", "decoding error response", err),
+				"taskID", taskID, "code", resp.StatusCode)
+			return
+		}
+		rejected := E("manager.stopTask",
+			fmt.Sprintf("worker %s rejected stop (%d): %s", worker, e.Code, e.Message), nil)
+		m.logger.Error("worker rejected stop", "err", rejected, "taskID", taskID, "code", e.Code)
+		return
+	}
+
+	m.logger.Info("task stopped on worker", "taskID", taskID, "addr", workerAddr)
 }
 
 func (m *Manager) DoHealthChecks(done <-chan struct{}) {

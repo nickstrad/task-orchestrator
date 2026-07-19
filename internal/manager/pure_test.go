@@ -10,7 +10,7 @@ import (
 )
 
 func TestWorkerTasksURL(t *testing.T) {
-	got := workerTasksURL("http://localhost:3001")
+	got := WorkerTasksURL("http://localhost:3001")
 	want := "http://localhost:3001/tasks"
 	if got != want {
 		t.Errorf("workerTasksURL() = %q, want %q", got, want)

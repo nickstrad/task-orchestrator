@@ -13,7 +13,7 @@ import (
 // makes it directly testable without standing up a Manager or a fake worker.
 
 // workerTasksURL builds the /tasks endpoint for a worker's base address.
-func workerTasksURL(workerAddr string) string {
+func WorkerTasksURL(workerAddr string) string {
 	return fmt.Sprintf("%s/tasks", workerAddr)
 }
 
