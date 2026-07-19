@@ -1,12 +1,8 @@
 package scheduler
 
 import (
-	"encoding/json"
-	"fmt"
 	"log/slog"
-	"net/http"
 
-	"github.com/nickstrad/task-orchestrator/internal/httpapi"
 	"github.com/nickstrad/task-orchestrator/internal/node"
 	"github.com/nickstrad/task-orchestrator/internal/task"
 	"github.com/nickstrad/task-orchestrator/internal/worker"
@@ -46,7 +42,7 @@ func (e *MarginalCostScheduler) Score(t task.Task, candidates []node.Node) (map[
 	for _, n := range candidates {
 		// One fetch per node: cpu, memory and task count all come from the
 		// same snapshot, so the terms below describe a single moment in time.
-		stats, err := e.getNodeStats(n)
+		stats, err := n.GetStats()
 		if err != nil {
 			return nil, Wrap(op, "scoring node "+n.Name, err)
 		}
@@ -76,48 +72,6 @@ func (e *MarginalCostScheduler) Score(t task.Task, candidates []node.Node) (map[
 func (e *MarginalCostScheduler) Pick(scores map[string]float64, candidates []node.Node) node.Node {
 	picked, _ := lowestScoringNode(scores, candidates)
 	return picked
-}
-
-// getNodeStats fetches a node's stats over HTTP. It sits on the process
-// boundary, so per docs/error-handling-and-logging.md it logs once here and
-// returns a fresh SchedulerError — callers must not log it a second time.
-func (e *MarginalCostScheduler) getNodeStats(n node.Node) (worker.Stats, error) {
-	op := "scheduler.MarginalCostScheduler.getNodeStats"
-
-	url := statsURL(n.API)
-	e.logger.Debug("fetching node stats", "node", n.Name, "url", url)
-
-	resp, err := http.Get(url)
-	if err != nil {
-		// resp is nil on a transport error, so this must return before the
-		// deferred Close below is ever set up.
-		statsErr := E(op, "connecting to node "+n.Name, err)
-		e.logger.Warn("connecting to node failed", "err", statsErr, "node", n.Name, "url", url)
-		return worker.Stats{}, statsErr
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		// The worker's Go error never crosses the wire — all that arrives is
-		// the httpapi DTO, so read what it said and mint our own error rather
-		// than pretend to wrap one we do not have.
-		var body httpapi.ErrorResponse
-		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-			body.Message = "unreadable error body"
-		}
-		statsErr := E(op, fmt.Sprintf("node %s returned %d: %s", n.Name, resp.StatusCode, body.Message), nil)
-		e.logger.Warn("node returned unexpected status", "err", statsErr, "node", n.Name, "code", resp.StatusCode)
-		return worker.Stats{}, statsErr
-	}
-
-	var stats worker.Stats
-	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
-		statsErr := E(op, "decoding stats from node "+n.Name, err)
-		e.logger.Warn("decoding node stats failed", "err", statsErr, "node", n.Name)
-		return worker.Stats{}, statsErr
-	}
-
-	return stats, nil
 }
 
 // cpuLoad reads CPU load out of an already-fetched snapshot. It takes stats

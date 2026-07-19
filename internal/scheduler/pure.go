@@ -105,11 +105,6 @@ const (
 	maxJobsPerNode = 4.0
 )
 
-// statsURL builds the URL of a node's stats endpoint.
-func statsURL(nodeAPI string) string {
-	return fmt.Sprintf("%s/stats", nodeAPI)
-}
-
 // hasDiskRoom reports whether a task's disk requirement fits in what the node
 // has left unallocated. A task asking for exactly the remaining space fits.
 func hasDiskRoom(taskDisk, nodeDisk, nodeDiskAllocated int) bool {
