@@ -1,23 +1,14 @@
 package worker
 
 import (
-	"errors"
 	"fmt"
-	"log"
-	"runtime/debug"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/nickstrad/task-orchestrator/internal/queue"
 	"github.com/nickstrad/task-orchestrator/internal/task"
 )
-
-type WorkerError struct {
-	Inner      error
-	Message    string
-	StackTrace string
-	Misc       map[string]interface{}
-}
 
 type Worker struct {
 	Name      string
@@ -26,14 +17,16 @@ type Worker struct {
 	Queue     *queue.Queue[task.Task]
 	TaskCount int
 	Stats     *Stats
+	logger    *slog.Logger
 }
 
-func NewWorker(name string, id int) Worker {
+func NewWorker(name string, id int, logger *slog.Logger) Worker {
 	return Worker{
-		Name:  name,
-		ID:    id,
-		Db:    make(map[uuid.UUID]task.Task),
-		Queue: queue.New[task.Task](),
+		Name:   name,
+		ID:     id,
+		Db:     make(map[uuid.UUID]task.Task),
+		Queue:  queue.New[task.Task](),
+		logger: logger,
 	}
 }
 
@@ -44,29 +37,17 @@ func (w *Worker) CollectStats(done <-chan struct{}) {
 			return
 		default:
 		}
-		log.Println("Collecting Stats")
-		w.Stats = NewStats()
+		w.logger.Debug("collecting stats")
+		w.Stats = NewStats(w.logger)
 		w.Stats.TaskCount = w.TaskCount
 		time.Sleep(time.Second * 15)
-	}
-}
-
-func WrapError(err error, messagef string, msgArgs ...interface{}) *WorkerError {
-	return &WorkerError{
-		Inner:      err,
-		Message:    fmt.Sprintf(messagef, msgArgs...),
-		StackTrace: string(debug.Stack()),
-		Misc:       make(map[string]interface{}),
 	}
 }
 
 func (w *Worker) RunTask() task.DockerResult {
 	taskQueued, ok := w.Queue.Dequeue()
 	if !ok {
-		errMsg := "No tasks in the queue."
-		err := task.WrapError(errors.New(errMsg), "%s", errMsg)
-		log.Println(err)
-		return task.NewDockerResult(err, "", "", "")
+		return task.NewDockerResult(E("worker.RunTask", "no tasks in the queue", nil), "", "", "")
 	}
 
 	taskPersisted, exists := w.Db[taskQueued.ID]
@@ -79,10 +60,8 @@ func (w *Worker) RunTask() task.DockerResult {
 	stateMachine := task.NewStateMachine()
 
 	if !stateMachine.IsValidTransition(taskPersisted.State, taskQueued.State) {
-		errMsg := "invalid state transition %d to %d."
-		err := task.WrapError(errors.New(errMsg), errMsg, taskPersisted.State, taskQueued.State)
-		log.Println(err)
-		return task.NewDockerResult(err, "", "", "")
+		msg := fmt.Sprintf("invalid state transition %s to %s", taskPersisted.State, taskQueued.State)
+		return task.NewDockerResult(E("worker.RunTask", msg, nil), "", "", "")
 	}
 
 	var result task.DockerResult
@@ -92,8 +71,8 @@ func (w *Worker) RunTask() task.DockerResult {
 	case task.Completed:
 		result = w.StopTask(taskQueued)
 	default:
-		errMsg := "invalid state %d"
-		result.Error = task.WrapError(errors.New(errMsg), errMsg, taskQueued.State)
+		msg := fmt.Sprintf("invalid state %s", taskQueued.State)
+		result.Error = E("worker.RunTask", msg, nil)
 	}
 
 	return result
@@ -102,36 +81,46 @@ func (w *Worker) RunTask() task.DockerResult {
 func (w *Worker) StartTask(t task.Task) task.DockerResult {
 	t.StartTime = time.Now().UTC()
 	config := task.NewConfig(t)
-	dockerHandler := task.NewDocker(config)
+	dockerHandler, err := task.NewDocker(config)
+	if err != nil {
+		t.State = task.Failed
+		w.Db[t.ID] = t
+		return task.NewDockerResult(Wrap("worker.StartTask", "creating docker handler", err), "", "", "")
+	}
 	result := dockerHandler.Run()
 
 	if result.Error != nil {
-		log.Printf("Error starting container:%v: %v\n", t.ContainerID, result.Error.Message)
 		t.State = task.Failed
 		w.Db[t.ID] = t
+		result.Error = Wrap("worker.StartTask", fmt.Sprintf("starting task %s", t.ID), result.Error)
 		return result
 	}
 
 	t.ContainerID = result.ContainerId
 	t.State = task.Running
 	w.Db[t.ID] = t
+	w.logger.Info("container started", "taskID", t.ID, "containerID", t.ContainerID, "image", t.Image)
 
 	return result
 }
 
 func (w *Worker) StopTask(t task.Task) task.DockerResult {
 	config := task.NewConfig(t)
-	dockerHandler := task.NewDocker(config)
+	dockerHandler, err := task.NewDocker(config)
+	if err != nil {
+		return task.NewDockerResult(Wrap("worker.StopTask", "creating docker handler", err), "", "", "")
+	}
 	result := dockerHandler.Stop(t.ContainerID)
 
 	if result.Error != nil {
-		log.Printf("Error stopping  container:%v: %v\n", t.ContainerID, result.Error.Message)
+		result.Error = Wrap("worker.StopTask", fmt.Sprintf("stopping task %s", t.ID), result.Error)
+		return result
 	}
 
 	t.FinishTime = time.Now().UTC()
 	t.State = task.Completed
 	w.Db[t.ID] = t
-	log.Printf("Stopped and removed container %v for task %v", t.ContainerID, t.ID)
+	w.logger.Info("container stopped and removed", "taskID", t.ID, "containerID", t.ContainerID)
 
 	return result
 }
@@ -157,29 +146,34 @@ func (w *Worker) RunTasks(done <-chan struct{}) {
 		case <-time.After(10 * time.Second):
 		}
 		if w.Queue.Len() != 0 {
+			// Terminal consumer: nobody above us can act on this, so log once here.
 			result := w.RunTask()
 			if result.Error != nil {
-				log.Printf("Error running task: %v\n", result.Error)
+				w.logger.Error("run task failed", "err", result.Error, "containerID", result.ContainerId)
 			}
 		} else {
-			log.Println("No tasks to process currently.")
+			w.logger.Debug("no tasks to process currently")
 		}
-		log.Println("Sleeping for 10 seconds")
+		w.logger.Debug("sleeping", "seconds", 10)
 	}
 }
 
 func (w *Worker) InspectTask(t task.Task) task.DockerInspectResponse {
 	config := task.NewConfig(t)
-	d := task.NewDocker(config)
+	d, err := task.NewDocker(config)
+	if err != nil {
+		return task.DockerInspectResponse{
+			Error: Wrap("worker.InspectTask", "creating docker handler", err),
+		}
+	}
 	return d.Inspect(t.ContainerID)
 }
 
 func (w *Worker) UpdateTasks() {
 	for {
-		log.Println("checking status of tasks")
+		w.logger.Debug("checking status of tasks")
 		w.updateTasks()
-		log.Println("Task updates completed")
-		log.Println("sleeping for 15 seconds")
+		w.logger.Debug("task updates completed, sleeping", "seconds", 15)
 		time.Sleep(15 * time.Second)
 	}
 }
@@ -190,14 +184,23 @@ func (w *Worker) updateTasks() {
 			continue
 		}
 
+		// Both of these leave resp.Container nil, so we must not fall through
+		// to the NetworkSettings dereference below.
 		resp := w.InspectTask(t)
 		if resp.Error != nil {
-			fmt.Printf("Error: %v\n", resp.Error)
-		} else if resp.Container == nil {
-			log.Printf("No container for running task %s\n", id)
+			w.logger.Warn("inspecting task failed", "err", resp.Error, "taskID", id)
+			continue
+		}
+		if resp.Container == nil {
+			w.logger.Warn("no container for running task", "taskID", id)
 			t.State = task.Failed
-		} else if resp.Container.Container.State.Status == "exited" {
-			log.Printf("container for task %s in non-running state %s", id, resp.Container.Container.State.Status)
+			w.Db[id] = t
+			continue
+		}
+
+		if resp.Container.Container.State.Status == "exited" {
+			w.logger.Warn("container in non-running state",
+				"taskID", id, "state", resp.Container.Container.State.Status)
 			t.State = task.Failed
 		}
 

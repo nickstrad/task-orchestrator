@@ -4,11 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/nickstrad/task-orchestrator/internal/httpapi"
 	"github.com/nickstrad/task-orchestrator/internal/task"
 )
 
@@ -18,18 +19,15 @@ type API struct {
 	Worker  *Worker
 	Router  *chi.Mux
 	Server  *http.Server
+	logger  *slog.Logger
 }
 
-type ErrorResponse struct {
-	Message string `json:"message"`
-	Code    int    `json:"code"`
-}
-
-func NewAPI(worker *Worker, host string, port int) API {
+func NewAPI(worker *Worker, host string, port int, logger *slog.Logger) API {
 	return API{
 		Address: host,
 		Port:    port,
 		Worker:  worker,
+		logger:  logger.With("subcomponent", "api"),
 	}
 }
 
@@ -37,82 +35,52 @@ func (a *API) StartTaskHandler(w http.ResponseWriter, r *http.Request) {
 	d := json.NewDecoder(r.Body)
 	d.DisallowUnknownFields()
 
-	w.Header().Set("Content-Type", "application/json")
-
 	taskEvent := task.TaskEvent{}
 	if err := d.Decode(&taskEvent); err != nil {
-		msg := fmt.Sprintf("Error unmarshalling body: %v\n", err)
-		log.Println(msg)
-		w.WriteHeader(400)
-		e := ErrorResponse{
-			Code:    500,
-			Message: msg,
-		}
-		json.NewEncoder(w).Encode(e)
+		// The error crossed a process boundary: log it here, send the client a message.
+		a.logger.Error("unmarshalling request body", "err", E("worker.API.StartTaskHandler", "decoding task event", err))
+		httpapi.WriteError(w, http.StatusBadRequest, "error unmarshalling body")
 		return
 	}
 
 	a.Worker.AddTask(taskEvent.Task)
-	log.Printf("Added task %v\n", taskEvent.Task.ID)
-	w.WriteHeader(201)
-	json.NewEncoder(w).Encode(taskEvent.Task)
+	a.logger.Info("task added", "taskID", taskEvent.Task.ID)
+	httpapi.WriteJSON(w, http.StatusCreated, taskEvent.Task)
 }
 
 func (a *API) GetTasksHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(200)
-	json.NewEncoder(w).Encode(a.Worker.GetTasks())
+	httpapi.WriteJSON(w, http.StatusOK, a.Worker.GetTasks())
 }
 
 func (a *API) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskID")
 	if taskID == "" {
-		msg := "No taskID passed in request"
-		log.Println(msg)
-		w.WriteHeader(400)
-		e := ErrorResponse{
-			Code:    500,
-			Message: msg,
-		}
-		json.NewEncoder(w).Encode(e)
+		a.logger.Warn("no taskID passed in request")
+		httpapi.WriteError(w, http.StatusBadRequest, "no taskID passed in request")
 		return
 	}
 
 	parsedTaskID, _ := uuid.Parse(taskID)
 
-	_, ok := a.Worker.Db[parsedTaskID]
+	taskToStop, ok := a.Worker.Db[parsedTaskID]
 	if !ok {
-		msg := "task does not exist on worker"
-		log.Println(msg)
-		e := ErrorResponse{
-			Code:    500,
-			Message: msg,
-		}
-		w.WriteHeader(404)
-		json.NewEncoder(w).Encode(e)
+		a.logger.Warn("task does not exist on worker", "taskID", taskID)
+		httpapi.WriteError(w, http.StatusNotFound, "task does not exist on worker")
 		return
 	}
 
-	taskToStop := a.Worker.Db[parsedTaskID]
 	taskCopy := taskToStop
 	taskCopy.State = task.Completed
 	a.Worker.AddTask(taskCopy)
 
-	msg := fmt.Sprintf("Added task %v to stop container %v\n", taskToStop.ID, taskToStop.ContainerID)
-	log.Println(msg)
-	w.WriteHeader(204)
-	e := ErrorResponse{
-		Message: msg,
-		Code:    204,
-	}
-	json.NewEncoder(w).Encode(e)
-
+	a.logger.Info("task added to stop container",
+		"taskID", taskToStop.ID, "containerID", taskToStop.ContainerID)
+	// 204 means no content — writing a body here would violate the status.
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *API) GetStatsHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(200)
-	json.NewEncoder(w).Encode(a.Worker.Stats)
+	httpapi.WriteJSON(w, http.StatusOK, a.Worker.Stats)
 }
 
 func (a *API) initRouter() {

@@ -4,12 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/nickstrad/task-orchestrator/internal/httpapi"
 	"github.com/nickstrad/task-orchestrator/internal/task"
 )
 
@@ -19,66 +20,49 @@ type API struct {
 	Router  *chi.Mux
 	Server  *http.Server
 	Manager Manager
+	logger  *slog.Logger
 }
 
-func NewAPI(host string, port int, manager Manager) API {
+func NewAPI(host string, port int, manager Manager, logger *slog.Logger) API {
 	return API{
 		Address: host,
 		Port:    port,
 		Manager: manager,
+		logger:  logger.With("subcomponent", "api"),
 	}
 }
 
 func (a *API) StartTaskHandler(w http.ResponseWriter, r *http.Request) {
 	d := json.NewDecoder(r.Body)
 	d.DisallowUnknownFields()
-	w.Header().Set("Content-Type", "application/json")
 
 	taskEvent := task.TaskEvent{}
 
 	if err := d.Decode(&taskEvent); err != nil {
-		msg := fmt.Sprintf("Error unmarshalling body: %v\n", err)
-		log.Println(msg)
-		w.WriteHeader(400)
-		e := ErrorResponse{
-			Code:    400,
-			Message: msg,
-		}
-		json.NewEncoder(w).Encode(e)
+		a.logger.Error("unmarshalling request body",
+			"err", E("manager.API.StartTaskHandler", "decoding task event", err))
+		httpapi.WriteError(w, http.StatusBadRequest, "error unmarshalling body")
 		return
 	}
 
 	a.Manager.AddTask(taskEvent)
-	fmt.Printf("Added task: %s\n", taskEvent.Task.ID)
-	w.WriteHeader(201)
-	json.NewEncoder(w).Encode(taskEvent)
+	a.logger.Info("task added", "taskID", taskEvent.Task.ID)
+	httpapi.WriteJSON(w, http.StatusCreated, taskEvent)
 }
 
 func (a *API) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskID")
 	if taskID == "" {
-		msg := "No taskID passed in request"
-		log.Println(msg)
-		w.WriteHeader(400)
-		e := ErrorResponse{
-			Code:    400,
-			Message: msg,
-		}
-		json.NewEncoder(w).Encode(e)
+		a.logger.Warn("no taskID passed in request")
+		httpapi.WriteError(w, http.StatusBadRequest, "no taskID passed in request")
 		return
 	}
 	parsedTaskID, _ := uuid.Parse(taskID)
 
 	t, exists := a.Manager.TaskDb[parsedTaskID]
 	if !exists {
-		msg := "task does not exist on worker"
-		log.Println(msg)
-		e := ErrorResponse{
-			Code:    404,
-			Message: msg,
-		}
-		w.WriteHeader(404)
-		json.NewEncoder(w).Encode(e)
+		a.logger.Warn("task does not exist on manager", "taskID", taskID)
+		httpapi.WriteError(w, http.StatusNotFound, "task does not exist on manager")
 		return
 	}
 	tCopy := t
@@ -91,14 +75,12 @@ func (a *API) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.Manager.AddTask(te)
-	fmt.Printf("Scheduled task %s to be deleted with task event %s\n", t.ID, te.ID)
-	w.WriteHeader(204)
+	a.logger.Info("task scheduled for deletion", "taskID", t.ID, "taskEventID", te.ID)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *API) GetTasksHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(200)
-	json.NewEncoder(w).Encode(a.Manager.GetTasks())
+	httpapi.WriteJSON(w, http.StatusOK, a.Manager.GetTasks())
 }
 
 func (a *API) initRouter() {

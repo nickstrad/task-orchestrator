@@ -1,8 +1,7 @@
 package worker
 
 import (
-	"fmt"
-	"log"
+	"log/slog"
 
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/disk"
@@ -18,15 +17,15 @@ type Stats struct {
 	TaskCount          int
 }
 
-func NewStats() *Stats {
+func NewStats(logger *slog.Logger) *Stats {
 	memStats, err := mem.VirtualMemory()
 	if err != nil {
-		log.Println(fmt.Errorf("unable to get mem stats for worker: %w", err))
+		logger.Warn("unable to get mem stats for worker", "err", err)
 		memStats = &mem.VirtualMemoryStat{}
 	}
 	diskStats, err := disk.Usage("/")
 	if err != nil {
-		log.Println(fmt.Errorf("unable to get disk stats for worker: %w", err))
+		logger.Warn("unable to get disk stats for worker", "err", err)
 		diskStats = &disk.UsageStat{}
 	}
 	// percpu=false → one aggregate value; interval=0 → non-blocking,
@@ -38,12 +37,12 @@ func NewStats() *Stats {
 	}
 
 	if err != nil {
-		log.Println(fmt.Errorf("unable to get cpu usage percentage for worker: %w", err))
+		logger.Warn("unable to get cpu usage percentage for worker", "err", err)
 	}
 
 	loadStats, err := load.Avg()
 	if err != nil {
-		log.Println(fmt.Errorf("unable to get mem stats for worker: %w", err))
+		logger.Warn("unable to get load stats for worker", "err", err)
 		loadStats = &load.AvgStat{}
 	}
 

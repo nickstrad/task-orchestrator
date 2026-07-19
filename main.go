@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,6 +20,9 @@ import (
 )
 
 func main() {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	slog.SetDefault(logger)
+	mainLogger := logger.With("component", "main")
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -34,14 +37,14 @@ func main() {
 	wg.Go(func() {
 		defer close(done)
 		sig := <-sigChan
-		fmt.Printf("\nmain process: Received signal: %v. Cleaning up...\n", sig)
+		mainLogger.Info("received signal, cleaning up", "signal", sig)
 	})
 
 	for i := range totalWorkers {
 		wg.Add(1)
 		go func(workerNum int) {
 			defer wg.Done()
-			stream, workerMetadata := doWork(done, workerNum)
+			stream, workerMetadata := doWork(done, workerNum, logger)
 			workerStream <- workerMetadata
 			for v := range stream {
 				select {
@@ -50,10 +53,10 @@ func main() {
 				default:
 				}
 				if v.Error != nil {
-					fmt.Printf("worker-%d: %v\n", workerNum, v.Error)
+					mainLogger.Error("worker update", "err", v.Error, "workerID", workerNum)
 					continue
 				}
-				fmt.Printf("worker-%d: %v", workerNum, v.Update)
+				mainLogger.Info("worker update", "update", v.Update, "workerID", workerNum)
 			}
 		}(i)
 	}
@@ -68,13 +71,14 @@ func main() {
 			}
 			workers = append(workers, <-workerStream)
 		}
-		m := manager.NewManager(workers, scheduler.RoundRobin)
-		api := manager.NewAPI(mHost, mPort, *m)
+		mLogger := logger.With("component", "manager", "addr", mAddr)
+		m := manager.NewManager(workers, scheduler.RoundRobin, mLogger)
+		api := manager.NewAPI(mHost, mPort, *m, mLogger)
 		go api.Start(done)
 		go api.Manager.UpdateTasks(done)
 		go api.Manager.DoHealthChecks(done)
 		go api.Manager.ProcessTasks(done)
-		fmt.Printf("Manager listening on: %s\n", mAddr)
+		mLogger.Info("listening")
 		defer api.Stop()
 		<-done
 	})
@@ -110,29 +114,29 @@ func main() {
 			data, err := json.Marshal(te)
 
 			if err != nil {
-				log.Printf("main process: Unable to marshal task object: %v.\n", t)
+				mainLogger.Error("unable to marshal task object", "err", err, "taskID", t.ID)
 				continue
 			}
 
-			fmt.Println("main process: sending task to manager!")
+			mainLogger.Info("sending task to manager", "taskID", t.ID)
 			resp, err := http.Post(fmt.Sprintf("%s/tasks", mAddr), "application/json", bytes.NewBuffer(data))
 			if err != nil {
-				fmt.Println(fmt.Errorf("main process: error sending task to manager %v", err))
+				mainLogger.Error("sending task to manager failed", "err", err, "taskID", t.ID)
 				continue
 			}
 
-			fmt.Printf("main process: %v\n", resp.Body)
 			d := json.NewDecoder(resp.Body)
 
 			respTaskEvent := task.TaskEvent{}
 
 			if err := d.Decode(&respTaskEvent); err != nil {
-				fmt.Println(fmt.Errorf("%s: Error unmarshalling body: %v\n", mAddr, err))
+				mainLogger.Error("unmarshalling response body failed", "err", err, "url", mAddr)
 				continue
 			}
 
-			fmt.Printf("main process: resp from manager: %v\n", respTaskEvent)
-			fmt.Println("main process: sleeping for 3 seconds")
+			mainLogger.Info("response from manager",
+				"taskID", respTaskEvent.Task.ID, "taskEventID", respTaskEvent.ID)
+			mainLogger.Debug("sleeping", "seconds", 3)
 			time.Sleep(3 * time.Second)
 		}
 	})
@@ -145,8 +149,10 @@ type UpdateValue struct {
 	Error  error
 }
 
-func doWork(done <-chan struct{}, workerNum int) (<-chan UpdateValue, manager.WorkerMetadata) {
+func doWork(done <-chan struct{}, workerNum int, logger *slog.Logger) (<-chan UpdateValue, manager.WorkerMetadata) {
 
+	// NOTE: nothing ever sends on valueStream — the UpdateValue plumbing is
+	// currently dead. Kept as-is; candidate for removal in a later pass.
 	valueStream := make(chan UpdateValue)
 	var wg sync.WaitGroup
 	workerName := fmt.Sprintf("worker-%d", workerNum)
@@ -154,24 +160,25 @@ func doWork(done <-chan struct{}, workerNum int) (<-chan UpdateValue, manager.Wo
 	port := 3000 + workerNum
 
 	workerAddr := fmt.Sprintf("http://%s:%d", host, port)
-	fmt.Printf("%s listenining on %s\n", workerName, workerAddr)
-	w := worker.NewWorker(workerName, workerNum)
+	wLogger := logger.With("component", workerName, "workerID", workerNum, "addr", workerAddr)
+	wLogger.Info("listening")
+	w := worker.NewWorker(workerName, workerNum, wLogger)
 	go w.CollectStats(done)
-	api := worker.NewAPI(&w, host, port)
+	api := worker.NewAPI(&w, host, port, wLogger)
 	wg.Go(func() {
-		fmt.Printf("%s: starting server \n", workerAddr)
+		wLogger.Info("starting server")
 		api.Start(done)
 	})
 
 	wg.Go(func() {
-		fmt.Printf("%s: starting run tasks \n", workerAddr)
+		wLogger.Info("starting run tasks")
 		w.RunTasks(done)
 	})
 
 	go func() {
 		defer close(valueStream)
 		wg.Wait()
-		fmt.Printf("%s: cleaning up closing value stream \n", workerAddr)
+		wLogger.Info("cleaning up, closing value stream")
 	}()
 
 	return valueStream, manager.WorkerMetadata{Name: workerName, ID: workerNum, Address: workerAddr}

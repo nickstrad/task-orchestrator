@@ -2,8 +2,8 @@ package task
 
 import (
 	"context"
+	"fmt"
 	"io"
-	"log"
 	"math"
 	"os"
 
@@ -18,7 +18,7 @@ type Docker struct {
 }
 
 type DockerResult struct {
-	Error       *TaskError
+	Error       error
 	Action      string
 	ContainerId string
 	Result      string
@@ -29,12 +29,15 @@ type DockerInspectResponse struct {
 	Container *client.ContainerInspectResult
 }
 
-func NewDocker(config Config) *Docker {
-	dockerClient, _ := client.New(client.FromEnv)
+func NewDocker(config Config) (*Docker, error) {
+	dockerClient, err := client.New(client.FromEnv)
+	if err != nil {
+		return nil, E("task.NewDocker", "creating docker client", err)
+	}
 	return &Docker{
 		Client: dockerClient,
 		Config: config,
-	}
+	}, nil
 }
 
 func NewConfig(t Task) Config {
@@ -53,18 +56,13 @@ func NewConfig(t Task) Config {
 	return config
 }
 
-func NewDockerResult(err *TaskError, action, containerId, result string) DockerResult {
-	d := DockerResult{
+func NewDockerResult(err error, action, containerId, result string) DockerResult {
+	return DockerResult{
+		Error:       err,
 		Action:      action,
 		ContainerId: containerId,
 		Result:      result,
 	}
-
-	if err != nil {
-		d.Error = err
-	}
-
-	return d
 }
 
 func (d *Docker) Run() DockerResult {
@@ -74,7 +72,7 @@ func (d *Docker) Run() DockerResult {
 	)
 
 	if err != nil {
-		taskError := WrapError(err, "Error pulling image %s: %v\n", d.Config.Image, err)
+		taskError := E("task.Docker.Run", fmt.Sprintf("pulling image %s", d.Config.Image), err)
 		return NewDockerResult(taskError, "", "", "")
 	}
 
@@ -109,14 +107,14 @@ func (d *Docker) Run() DockerResult {
 
 	containerCreateResp, err := d.Client.ContainerCreate(ctx, containerCreateOptions)
 	if err != nil {
-		taskError := WrapError(err, "Error creating container using image %s: %v\n", d.Config.Image, err)
+		taskError := E("task.Docker.Run", fmt.Sprintf("creating container using image %s", d.Config.Image), err)
 		return NewDockerResult(taskError, "", "", "")
 	}
 
 	containerStartOptions := client.ContainerStartOptions{}
 	_, err = d.Client.ContainerStart(ctx, containerCreateResp.ID, containerStartOptions)
 	if err != nil {
-		taskError := WrapError(err, "Error starting container with id %s: %v\n", containerCreateResp.ID, err)
+		taskError := E("task.Docker.Run", fmt.Sprintf("starting container with id %s", containerCreateResp.ID), err)
 		return NewDockerResult(taskError, "", "", "")
 	}
 
@@ -128,7 +126,7 @@ func (d *Docker) Run() DockerResult {
 	}
 	out, err := d.Client.ContainerLogs(ctx, containerCreateResp.ID, containerLogOptions)
 	if err != nil {
-		taskError := WrapError(err, "Error getting logs from container with id %s: %v\n", containerCreateResp.ID, err)
+		taskError := E("task.Docker.Run", fmt.Sprintf("getting logs from container with id %s", containerCreateResp.ID), err)
 		return NewDockerResult(taskError, "", "", "")
 	}
 
@@ -137,13 +135,12 @@ func (d *Docker) Run() DockerResult {
 }
 
 func (d *Docker) Stop(id string) DockerResult {
-	log.Printf("Attempting to stop container %v", id)
 	ctx := context.Background()
 
 	containerStopOptions := client.ContainerStopOptions{}
 	_, err := d.Client.ContainerStop(ctx, id, containerStopOptions)
 	if err != nil {
-		taskError := WrapError(err, "Error stopping container with id %s: %v\n", id, err)
+		taskError := E("task.Docker.Stop", fmt.Sprintf("stopping container with id %s", id), err)
 		return NewDockerResult(taskError, "", "", "")
 	}
 
@@ -151,7 +148,7 @@ func (d *Docker) Stop(id string) DockerResult {
 
 	_, err = d.Client.ContainerRemove(ctx, id, containerRemoveOptions)
 	if err != nil {
-		taskError := WrapError(err, "Error removing container with id %s: %v\n", id, err)
+		taskError := E("task.Docker.Stop", fmt.Sprintf("removing container with id %s", id), err)
 		return NewDockerResult(taskError, "", "", "")
 	}
 
@@ -164,8 +161,9 @@ func (d *Docker) Inspect(containerID string) DockerInspectResponse {
 	resp, err := d.Client.ContainerInspect(ctx, containerID, containerInspectOptions)
 
 	if err != nil {
-		log.Printf("Error inspecting container: %s\n", err)
-		return DockerInspectResponse{Error: err}
+		return DockerInspectResponse{
+			Error: E("task.Docker.Inspect", fmt.Sprintf("inspecting container %s", containerID), err),
+		}
 	}
 
 	return DockerInspectResponse{Container: &resp}

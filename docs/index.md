@@ -1,0 +1,31 @@
+# Documentation Index
+
+`task-orchestrator` is a **learning project** — a small Kubernetes-like orchestrator that
+schedules Docker containers across in-process workers. This index describes every
+document here and what it is for. Start with the conventions, then the reference
+material.
+
+## Conventions — how the code works today
+
+Follow these when writing code.
+
+| Document | What it covers |
+| --- | --- |
+| [`error-handling-and-logging.md`](error-handling-and-logging.md) | **Read before writing any error or log line.** Per-package error types (`TaskError`/`WorkerError`/`ManagerError`), the `E`-at-the-boundary / `Wrap`-above-it rule, one-log-per-error, `slog` child loggers and attribute keys, and the `internal/httpapi` helpers for HTTP responses. |
+
+## Reference — where the project could go next
+
+Forward-looking material in [`reference/`](reference/). These describe systems that **do
+not exist in this repo**. They are thinking tools, not specs — don't implement from them
+unless asked.
+
+| Document | What it covers |
+| --- | --- |
+| [`reference/coding-agent-platform-refactor-reference.md`](reference/coding-agent-platform-refactor-reference.md) | A post-book sketch of turning this orchestrator into a small platform for running coding agents in isolated environments — accepting a task plus a repo reference, scheduling it onto a compatible worker, and where the current model would need to change. Contains no working code. |
+| [`reference/cloud-coding-sandbox-environment-reference.md`](reference/cloud-coding-sandbox-environment-reference.md) | How a cloud coding-agent platform can build a usable, isolated dev environment given only a repo, a commit or branch, a task, and Kubernetes workers using Kata Containers. |
+
+## Adding a document
+
+Put it in `docs/` if it describes this codebase, or `docs/reference/` if it describes
+something that does not exist yet — then add a row to the right table above. See
+[`AGENTS.md`](../AGENTS.md) at the repo root for the working guidelines.
