@@ -30,3 +30,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Pipeline artifacts (do-next-plan / judge-branch), regenerated per run
+CHANGE_SUMMARY.md
