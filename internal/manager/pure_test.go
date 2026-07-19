@@ -282,3 +282,120 @@ func TestGetHostPort(t *testing.T) {
 		}
 	})
 }
+
+// TestMergeTaskUpdateRejectsInvalidTransitions pins the guard that makes
+// retireTask safe: the manager marks a stopped task Completed immediately, but
+// the worker keeps reporting Running until its queue drains. Completed is
+// terminal, so that stale report must not walk the task back into a state the
+// health check loop acts on.
+func TestMergeTaskUpdateRejectsInvalidTransitions(t *testing.T) {
+	tests := []struct {
+		name      string
+		persisted task.State
+		incoming  task.State
+		want      task.State
+	}{
+		{
+			name:      "a stale running report cannot resurrect a completed task",
+			persisted: task.Completed,
+			incoming:  task.Running,
+			want:      task.Completed,
+		},
+		{
+			name:      "a completed task stays completed when reported again",
+			persisted: task.Completed,
+			incoming:  task.Completed,
+			want:      task.Completed,
+		},
+		{
+			name:      "a running task may complete",
+			persisted: task.Running,
+			incoming:  task.Completed,
+			want:      task.Completed,
+		},
+		{
+			name:      "a running task may fail",
+			persisted: task.Running,
+			incoming:  task.Failed,
+			want:      task.Failed,
+		},
+		{
+			name:      "a running task stays running",
+			persisted: task.Running,
+			incoming:  task.Running,
+			want:      task.Running,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id := uuid.New()
+			got := mergeTaskUpdate(
+				task.Task{ID: id, State: tt.persisted},
+				task.Task{ID: id, State: tt.incoming},
+			)
+			if got.State != tt.want {
+				t.Errorf("mergeTaskUpdate(%v, %v).State = %v, want %v",
+					tt.persisted, tt.incoming, got.State, tt.want)
+			}
+		})
+	}
+}
+
+// TestMergeTaskUpdateKeepsWorkerFieldsOnARejectedTransition asserts a rejected
+// report is dropped whole — a task that cannot change state must not pick up
+// the container fields from the same stale report either.
+func TestMergeTaskUpdateKeepsWorkerFieldsOnARejectedTransition(t *testing.T) {
+	id := uuid.New()
+	persisted := task.Task{ID: id, State: task.Completed, ContainerID: "settled"}
+	incoming := task.Task{ID: id, State: task.Running, ContainerID: "stale"}
+
+	got := mergeTaskUpdate(persisted, incoming)
+
+	if got.ContainerID != "settled" {
+		t.Errorf("ContainerID = %q, want %q", got.ContainerID, "settled")
+	}
+}
+
+func TestRetireTaskDropsRoutingButKeepsTheRecord(t *testing.T) {
+	id, other := uuid.New(), uuid.New()
+	m := &Manager{
+		TaskDb:        map[uuid.UUID]task.Task{id: {ID: id, State: task.Running}},
+		TaskWorkerMap: map[uuid.UUID]string{id: "worker-1"},
+		WorkerTaskMap: map[string][]uuid.UUID{"worker-1": {other, id}},
+	}
+
+	m.retireTask("worker-1", id)
+
+	if got := m.TaskDb[id].State; got != task.Completed {
+		t.Errorf("TaskDb state = %v, want %v", got, task.Completed)
+	}
+	if _, ok := m.TaskWorkerMap[id]; ok {
+		t.Error("TaskWorkerMap still routes the retired task")
+	}
+	assigned := m.WorkerTaskMap["worker-1"]
+	if len(assigned) != 1 || assigned[0] != other {
+		t.Errorf("WorkerTaskMap[worker-1] = %v, want exactly [%v]", assigned, other)
+	}
+}
+
+// TestRetireTaskLeavesOtherWorkersAlone pins the wrong-key bug: the assignment
+// list must be written back under the worker name, never under the task ID.
+func TestRetireTaskLeavesOtherWorkersAlone(t *testing.T) {
+	id := uuid.New()
+	m := &Manager{
+		TaskDb:        map[uuid.UUID]task.Task{id: {ID: id, State: task.Running}},
+		TaskWorkerMap: map[uuid.UUID]string{id: "worker-1"},
+		WorkerTaskMap: map[string][]uuid.UUID{"worker-1": {id}},
+	}
+
+	m.retireTask("worker-1", id)
+
+	if len(m.WorkerTaskMap) != 1 {
+		t.Errorf("WorkerTaskMap grew to %d keys (%v), want only worker-1",
+			len(m.WorkerTaskMap), m.WorkerTaskMap)
+	}
+	if got, ok := m.WorkerTaskMap["worker-1"]; !ok || len(got) != 0 {
+		t.Errorf("WorkerTaskMap[worker-1] = %v (present=%v), want empty", got, ok)
+	}
+}

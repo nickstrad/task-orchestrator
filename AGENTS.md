@@ -13,6 +13,38 @@ production software as fast as possible.
 - Skeleton/incomplete code (e.g. stub functions, TODO-like fragments) is expected and often
   intentional work-in-progress — don't "complete" it on your own initiative.
 
+## Reporting changes
+
+When I ask you to change code or fix a bug, report the result as a list of findings, each
+one a vertically stacked before/after snippet with a concise explanation:
+
+````markdown
+## 1. Short title naming the defect
+
+```go
+// before
+copy = slices.Delete(copy, idx, idx)
+
+// after
+m.WorkerTaskMap[worker] = slices.Delete(assigned, idx, idx+1)
+```
+
+`Delete(s, i, j)` removes the half-open range `s[i:j]`, so `i == j` was a silent no-op —
+the task stayed in the worker's list forever.
+````
+
+- **Stack before over after**, never side by side. Long lines wrap badly in a terminal.
+- **Snippets are excerpts, not whole functions.** Show the few lines that changed plus
+  just enough context to place them.
+- **One numbered finding per defect**, ordered most to least severe, each with a title
+  that names the defect rather than the fix.
+- **Explain the consequence, not the edit.** The diff already shows what changed; say
+  what went wrong at runtime and why. Point out when a fix is untestable, unreachable,
+  or silent.
+- **Flag behavior changes separately** and say which one to push back on if I disagree.
+- Group trivia (typos, constants, renames) into one final block rather than numbering
+  each one.
+
 ## Commits
 
 - **Never commit unless I explicitly ask you to.** Leave finished work in the working
