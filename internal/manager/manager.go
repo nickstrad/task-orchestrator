@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,9 +19,17 @@ import (
 
 const (
 	TaskRestartMax = 3
+
+	// Default cadences for the background loops. They are fields on Manager
+	// rather than literals inside the loops so a test can drive a loop in
+	// milliseconds instead of sitting through real minutes.
+	DefaultUpdateInterval      = 15 * time.Second
+	DefaultProcessInterval     = 10 * time.Second
+	DefaultHealthCheckInterval = 60 * time.Second
 )
 
 type Manager struct {
+	mu                  sync.RWMutex
 	LastWorker          int
 	Pending             *queue.Queue[task.TaskEvent]
 	TaskDb              map[uuid.UUID]task.Task
@@ -33,6 +42,12 @@ type Manager struct {
 	WorkerNodes         []node.Node
 	Scheduler           scheduler.Scheduler
 	logger              *slog.Logger
+
+	// How often each background loop wakes. Defaulted by NewManager; a test
+	// overrides them to keep the loops sub-second.
+	updateInterval      time.Duration
+	processInterval     time.Duration
+	healthCheckInterval time.Duration
 }
 
 type WorkerMetadata struct {
@@ -71,19 +86,19 @@ func NewManager(workers []WorkerMetadata, schedulerType string, logger *slog.Log
 		Scheduler:           s,
 		WorkerNodes:         nodes,
 		logger:              logger,
+		updateInterval:      DefaultUpdateInterval,
+		processInterval:     DefaultProcessInterval,
+		healthCheckInterval: DefaultHealthCheckInterval,
 	}
 }
 
 func (m *Manager) SelectWorker(t task.Task) (node.Node, error) {
-	candidates := m.Scheduler.SelectCandidateNodes(t, m.WorkerNodes)
-	if candidates == nil {
+	selected, ok := m.pickWorker(t)
+	if !ok {
 		msg := fmt.Sprintf("no available candidates match resource request for task %s", t.ID)
 		return node.Node{}, E("manager.SelectWorker", msg, nil)
 	}
-	scores := m.Scheduler.Score(t, candidates)
-	selectedNode := m.Scheduler.Pick(scores, candidates)
-
-	return selectedNode, nil
+	return selected, nil
 }
 
 func (m *Manager) UpdateTasks(done <-chan struct{}) {
@@ -91,10 +106,10 @@ func (m *Manager) UpdateTasks(done <-chan struct{}) {
 		select {
 		case <-done:
 			return
-		case <-time.After(15 * time.Second):
+		case <-time.After(m.updateInterval):
 			m.logger.Debug("updating tasks")
 			m.updateTasks()
-			m.logger.Debug("sleeping", "seconds", 15)
+			m.logger.Debug("sleeping", "interval", m.updateInterval)
 		}
 	}
 }
@@ -104,10 +119,10 @@ func (m *Manager) ProcessTasks(done <-chan struct{}) {
 		select {
 		case <-done:
 			return
-		case <-time.After(10 * time.Second):
+		case <-time.After(m.processInterval):
 			m.logger.Debug("delegating tasks to workers")
 			m.SendWork()
-			m.logger.Debug("sleeping", "seconds", 10)
+			m.logger.Debug("sleeping", "interval", m.processInterval)
 		}
 	}
 }
@@ -121,8 +136,10 @@ func (m *Manager) updateTasks() {
 }
 
 func (m *Manager) updateTasksFromWorker(workerName string) {
+	// Set once by NewManager and never written again, so no lock is needed.
 	workerID := m.WorkerNameToID[workerName]
 	workerURL := m.WorkerNameToAddress[workerName]
+
 	m.logger.Debug("checking worker for task updates", "workerID", workerID, "url", workerURL)
 	url := WorkerTasksURL(workerURL)
 	resp, err := http.Get(url)
@@ -150,37 +167,28 @@ func (m *Manager) updateTasksFromWorker(workerName string) {
 	}
 
 	for _, t := range tasks {
-		persisted, ok := m.TaskDb[t.ID]
-		if !ok {
-			// One unknown task must not abort updates for the remaining tasks.
+		// One unknown task must not abort updates for the remaining tasks.
+		if !m.applyWorkerReport(t) {
 			m.logger.Warn("task not found in task db", "taskID", t.ID, "workerID", workerID)
-			continue
 		}
-
-		m.TaskDb[t.ID] = mergeTaskUpdate(persisted, t)
 	}
 }
 
 func (m *Manager) SendWork() {
-	if m.Pending.Len() == 0 {
-		m.logger.Debug("no work in the queue")
-		return
-	}
-	taskEvent, ok := m.Pending.Dequeue()
-
+	taskEvent, ok := m.nextPendingEvent()
 	if !ok {
+		m.logger.Debug("no work in the queue")
 		return
 	}
 	t := taskEvent.Task
 	m.logger.Debug("pulled task off pending queue", "taskID", t.ID)
 
-	taskWorker, ok := m.TaskWorkerMap[t.ID]
+	taskWorker, persistedTask, ok := m.assignmentFor(t.ID)
 	if ok {
 		m.logger.Debug("task already exists in task worker map", "taskID", t.ID)
 		stateMachine := task.NewStateMachine()
-		persistedTask := m.TaskDb[t.ID]
 		if t.State == task.Completed && stateMachine.IsValidTransition(persistedTask.State, t.State) {
-			m.stopTask(taskWorker, t.ID.String())
+			m.stopTask(taskWorker, t.ID)
 			return
 		}
 		m.logger.Warn("ignoring invalid transition to completed",
@@ -195,25 +203,26 @@ func (m *Manager) SendWork() {
 	}
 
 	workerName := node.Name
-	m.EventDb[taskEvent.ID] = taskEvent
-	m.WorkerTaskMap[workerName] = append(m.WorkerTaskMap[workerName], t.ID)
-	m.TaskWorkerMap[t.ID] = workerName
-
 	data, err := json.Marshal(taskEvent)
-
 	if err != nil {
 		m.logger.Error("marshalling task event failed",
 			"err", E("manager.SendWork", "marshalling task event", err), "taskID", t.ID)
 		return
 	}
 
+	m.assignTask(workerName, taskEvent)
+
 	url := WorkerTasksURL(m.WorkerNameToAddress[workerName])
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
 
 	if err != nil {
+		// The assignment was committed before the send, so it has to be rolled
+		// back: a requeued task that is still routed to a worker looks like a
+		// duplicate on the next pass and gets dropped.
+		m.unassignTask(workerName, t.ID)
 		m.logger.Warn("worker unreachable, requeueing task",
 			"err", E("manager.SendWork", "connecting to worker "+workerName, err), "taskID", t.ID)
-		m.Pending.Enqueue(taskEvent)
+		m.enqueueEvent(taskEvent)
 		return
 	}
 	defer resp.Body.Close()
@@ -244,24 +253,20 @@ func (m *Manager) SendWork() {
 		return
 	}
 
-	m.TaskDb[newTask.ID] = newTask
+	m.putTask(newTask)
 	m.logger.Info("task sent to worker", "taskID", newTask.ID, "state", newTask.State)
 }
 
 func (m *Manager) AddTask(taskEvent task.TaskEvent) {
-	m.Pending.Enqueue(taskEvent)
+	m.enqueueEvent(taskEvent)
 }
 
 func (m *Manager) GetTasks() []task.Task {
-	tasks := []task.Task{}
-	for _, task := range m.TaskDb {
-		tasks = append(tasks, task)
-	}
-	return tasks
+	return m.snapshotTasks()
 }
 
 func (m *Manager) checkTaskHealth(t task.Task) error {
-	workerName, exists := m.TaskWorkerMap[t.ID]
+	workerName, exists := m.workerForTask(t.ID)
 
 	if !exists {
 		return E("manager.checkTaskHealth", fmt.Sprintf("no worker found for task %s", t.ID), nil)
@@ -326,11 +331,22 @@ func (m *Manager) doHealthChecks() {
 }
 
 func (m *Manager) restartTask(t task.Task) {
-	w := m.TaskWorkerMap[t.ID]
+	w, exists := m.workerForTask(t.ID)
+	if !exists {
+		m.logger.Error("restarting task failed",
+			"err", E("manager.restartTask", fmt.Sprintf("no worker assigned to task %s", t.ID), nil),
+			"taskID", t.ID)
+		return
+	}
 	wAddress := m.WorkerNameToAddress[w]
-	t.State = task.Scheduled
-	t.RestartCount++
-	m.TaskDb[t.ID] = t
+
+	t, ok := m.beginRestart(t.ID)
+	if !ok {
+		m.logger.Error("restarting task failed",
+			"err", E("manager.restartTask", fmt.Sprintf("task %s is not in the task db", t.ID), nil),
+			"taskID", t.ID)
+		return
+	}
 
 	te := task.TaskEvent{
 		ID:        uuid.New(),
@@ -350,7 +366,7 @@ func (m *Manager) restartTask(t task.Task) {
 		m.logger.Warn("worker unreachable, requeueing task",
 			"err", E("manager.restartTask", "connecting to worker "+w, err),
 			"taskID", t.ID, "addr", wAddress)
-		m.Pending.Enqueue(te)
+		m.enqueueEvent(te)
 		return
 	}
 
@@ -379,7 +395,7 @@ func (m *Manager) restartTask(t task.Task) {
 	m.logger.Info("task restarted", "taskID", newTask.ID, "restartCount", t.RestartCount)
 }
 
-func (m *Manager) stopTask(worker string, taskID string) {
+func (m *Manager) stopTask(worker string, taskID uuid.UUID) {
 	workerAddr, exists := m.WorkerNameToAddress[worker]
 	if !exists {
 		m.logger.Error("stopping task failed",
@@ -388,7 +404,7 @@ func (m *Manager) stopTask(worker string, taskID string) {
 		return
 	}
 
-	url := fmt.Sprintf("%s/%s", WorkerTasksURL(workerAddr), taskID)
+	url := fmt.Sprintf("%s/%s", WorkerTasksURL(workerAddr), taskID.String())
 	req, err := http.NewRequest(http.MethodDelete, url, nil)
 	if err != nil {
 		m.logger.Error("building stop request failed",
@@ -423,6 +439,7 @@ func (m *Manager) stopTask(worker string, taskID string) {
 		return
 	}
 
+	m.retireTask(worker, taskID)
 	m.logger.Info("task stopped on worker", "taskID", taskID, "addr", workerAddr)
 }
 
@@ -430,7 +447,7 @@ func (m *Manager) DoHealthChecks(done <-chan struct{}) {
 	work := func() {
 		m.logger.Debug("performing task health checks")
 		m.doHealthChecks()
-		m.logger.Debug("task health checks completed, sleeping", "seconds", 60)
+		m.logger.Debug("task health checks completed, sleeping", "interval", m.healthCheckInterval)
 	}
 
 	select {
@@ -443,7 +460,7 @@ func (m *Manager) DoHealthChecks(done <-chan struct{}) {
 		select {
 		case <-done:
 			return
-		case <-time.After(60 * time.Second):
+		case <-time.After(m.healthCheckInterval):
 			work()
 		}
 	}
