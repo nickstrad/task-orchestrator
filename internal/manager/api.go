@@ -19,11 +19,11 @@ type API struct {
 	Port    int
 	Router  *chi.Mux
 	Server  *http.Server
-	Manager Manager
+	Manager *Manager
 	logger  *slog.Logger
 }
 
-func NewAPI(host string, port int, manager Manager, logger *slog.Logger) API {
+func NewAPI(host string, port int, manager *Manager, logger *slog.Logger) API {
 	return API{
 		Address: host,
 		Port:    port,
