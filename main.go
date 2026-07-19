@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nickstrad/task-orchestrator/internal/manager"
+	"github.com/nickstrad/task-orchestrator/internal/scheduler"
 	"github.com/nickstrad/task-orchestrator/internal/task"
 	"github.com/nickstrad/task-orchestrator/internal/worker"
 )
@@ -67,7 +68,7 @@ func main() {
 			}
 			workers = append(workers, <-workerStream)
 		}
-		m := manager.NewManager(workers)
+		m := manager.NewManager(workers, scheduler.RoundRobin)
 		api := manager.NewAPI(mHost, mPort, *m)
 		go api.Start(done)
 		go api.Manager.UpdateTasks(done)

@@ -12,7 +12,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/moby/moby/api/types/network"
+	"github.com/nickstrad/task-orchestrator/internal/node"
 	"github.com/nickstrad/task-orchestrator/internal/queue"
+	"github.com/nickstrad/task-orchestrator/internal/scheduler"
 	"github.com/nickstrad/task-orchestrator/internal/task"
 	"github.com/nickstrad/task-orchestrator/internal/worker"
 )
@@ -31,6 +33,8 @@ type Manager struct {
 	WorkerNameToAddress map[string]string
 	TaskWorkerMap       map[uuid.UUID]string
 	WorkerNameToID      map[string]int
+	WorkerNodes         []node.Node
+	Scheduler           scheduler.Scheduler
 }
 type ErrorResponse struct {
 	Message string `json:"message"`
@@ -47,19 +51,22 @@ type WorkerMetadata struct {
 	Address string
 }
 
-func NewManager(workers []WorkerMetadata) *Manager {
+func NewManager(workers []WorkerMetadata, schedulerType string) *Manager {
 	workerTaskMap := make(map[string][]uuid.UUID)
 	workerNameToID := make(map[string]int)
 	workerNameToAddress := make(map[string]string)
 	workerNames := []string{}
 
+	var nodes []node.Node
 	for _, w := range workers {
 		workerTaskMap[w.Name] = []uuid.UUID{}
 		workerNameToID[w.Name] = w.ID
 		workerNames = append(workerNames, w.Name)
 		workerNameToAddress[w.Name] = w.Address
-
+		nodes = append(nodes, node.NewNode(w.Name, w.Address, "worker"))
 	}
+
+	s := scheduler.GetScheduler(schedulerType)
 
 	return &Manager{
 		LastWorker:     0,
@@ -70,16 +77,22 @@ func NewManager(workers []WorkerMetadata) *Manager {
 		WorkerNameToID: workerNameToID,
 		WorkerTaskMap:  workerTaskMap,
 		TaskWorkerMap:  make(map[uuid.UUID]string),
+		Scheduler:      s,
+		WorkerNodes:    nodes,
 	}
 }
 
-func (m *Manager) SelectWorker() string {
-	if m.LastWorker == len(m.Workers)-1 {
-		m.LastWorker = 0
-	} else {
-		m.LastWorker += 1
+func (m *Manager) SelectWorker(t task.Task) (node.Node, error) {
+	candidates := m.Scheduler.SelectCandidateNodes(t, m.WorkerNodes)
+	if candidates == nil {
+		msg := fmt.Sprintf("No available candidates match resource request for task %v", t.ID)
+		err := errors.New(msg)
+		return node.Node{}, err
 	}
-	return m.Workers[m.LastWorker]
+	scores := m.Scheduler.Score(t, candidates)
+	selectedNode := m.Scheduler.Pick(scores, candidates)
+
+	return selectedNode, nil
 }
 
 func (m *Manager) UpdateTasks(done <-chan struct{}) {
@@ -152,17 +165,24 @@ func (m *Manager) SendWork() {
 		log.Println("No work in the queue ")
 		return
 	}
-	worker := m.SelectWorker()
 	taskEvent, ok := m.Pending.Dequeue()
+
 	if !ok {
 		return
 	}
 	t := taskEvent.Task
 	log.Printf("Pulled %v off pending queue\n", t)
 
+	node, err := m.SelectWorker(taskEvent.Task)
+	if err != nil {
+		log.Printf("error selecting worker for task %s: %v\n", t.ID, err)
+		return
+	}
+
+	workerName := node.Name
 	m.EventDb[taskEvent.ID] = taskEvent
-	m.WorkerTaskMap[worker] = append(m.WorkerTaskMap[worker], t.ID)
-	m.TaskWorkerMap[t.ID] = worker
+	m.WorkerTaskMap[workerName] = append(m.WorkerTaskMap[workerName], t.ID)
+	m.TaskWorkerMap[t.ID] = workerName
 
 	data, err := json.Marshal(taskEvent)
 
@@ -171,12 +191,12 @@ func (m *Manager) SendWork() {
 		return
 	}
 
-	workerID := m.WorkerNameToID[worker]
+	workerID := m.WorkerNameToID[workerName]
 	url := fmt.Sprintf("%s/tasks", getWorkerUrl(workerID))
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
 
 	if err != nil {
-		log.Printf("Error connecting to %v: %v\n", worker, err)
+		log.Printf("Error connecting to %v: %v\n", workerName, err)
 		m.Pending.Enqueue(taskEvent)
 		return
 	}
