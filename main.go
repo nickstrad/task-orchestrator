@@ -27,7 +27,7 @@ func main() {
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	totalWorkers := 2
+	totalWorkers := 4
 	mHost := "localhost"
 	mPort := 3000 + totalWorkers + 1
 	mAddr := fmt.Sprintf("http://%s:%d", mHost, mPort)
@@ -74,7 +74,7 @@ func main() {
 		}
 		mLogger := logger.With("component", "manager", "addr", mAddr)
 		m := manager.NewManager(workers, scheduler.RoundRobin, mLogger)
-		api := manager.NewAPI(mHost, mPort, *m, mLogger)
+		api := manager.NewAPI(mHost, mPort, m, mLogger)
 		go api.Start(done)
 		go api.Manager.UpdateTasks(done)
 		go api.Manager.DoHealthChecks(done)
@@ -87,7 +87,9 @@ func main() {
 	wg.Go(func() {
 		taskEvents := []task.TaskEvent{
 			newEchoServerTaskEvent("echo-healthy", "/health"),
-			newEchoServerTaskEvent("echo-healthfail", "/healthfail"),
+			newEchoServerTaskEvent("echo-healthfail", "/health"),
+			newEchoServerTaskEvent("echo-healthfail", "/health"),
+			newEchoServerTaskEvent("echo-healthfail", "/health"),
 		}
 		for _, te := range taskEvents {
 			select {
@@ -146,7 +148,7 @@ const (
 func newEchoServerTask(name, healthCheck string) task.Task {
 	return task.Task{
 		ID:           uuid.New(),
-		Name:         name,
+		Name:         fmt.Sprintf("%s%v", name, uuid.New()),
 		State:        task.Scheduled,
 		Image:        echoServerImage,
 		ExposedPorts: network.PortSet{network.MustParsePort(echoServerPort): struct{}{}},
