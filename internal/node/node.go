@@ -2,7 +2,7 @@ package node
 
 type Node struct {
 	Name            string
-	Ip              string
+	API             string
 	Cores           int
 	Memory          int
 	MemoryAllocated int
@@ -15,7 +15,7 @@ type Node struct {
 func NewNode(name, addr, role string) Node {
 	return Node{
 		Name: name,
-		Ip:   addr,
+		API:  addr,
 		Role: role,
 	}
 }

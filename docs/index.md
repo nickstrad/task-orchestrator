@@ -24,6 +24,7 @@ unless asked.
 | --- | --- |
 | [`reference/coding-agent-platform-refactor-reference.md`](reference/coding-agent-platform-refactor-reference.md) | A post-book sketch of turning this orchestrator into a small platform for running coding agents in isolated environments — accepting a task plus a repo reference, scheduling it onto a compatible worker, and where the current model would need to change. Contains no working code. |
 | [`reference/cloud-coding-sandbox-environment-reference.md`](reference/cloud-coding-sandbox-environment-reference.md) | How a cloud coding-agent platform can build a usable, isolated dev environment given only a repo, a commit or branch, a task, and Kubernetes workers using Kata Containers. |
+| [`reference/agentic-platform-scheduling-reference.md`](reference/agentic-platform-scheduling-reference.md) | Scheduling for an agent platform, in depth: resource vectors, feasibility filters vs. scoring plugins, spread-vs-pack, multidimensional fragmentation, headroom for bursty agents, warm-cache affinity, tenant fairness, reservations and reconciliation. Ends with a ten-milestone roadmap from round robin to a coding-agent thin slice, plus a reading order (Borg, Kubernetes, DRF, Omega, Mesos). Roadmap, not a spec. |
 
 ## Adding a document
 
