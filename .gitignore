@@ -33,3 +33,4 @@ go.work.sum
 
 # Pipeline artifacts (do-next-plan / judge-branch), regenerated per run
 CHANGE_SUMMARY.md
+JUDGEMENT.md
