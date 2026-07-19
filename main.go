@@ -73,7 +73,7 @@ func main() {
 			workers = append(workers, <-workerStream)
 		}
 		mLogger := logger.With("component", "manager", "addr", mAddr)
-		m := manager.NewManager(workers, scheduler.RoundRobin, mLogger)
+		m := manager.NewManager(workers, scheduler.MarginalCost, mLogger)
 		api := manager.NewAPI(mHost, mPort, m, mLogger)
 		go api.Start(done)
 		go api.Manager.UpdateTasks(done)

@@ -71,7 +71,7 @@ func NewManager(workers []WorkerMetadata, schedulerType string, logger *slog.Log
 		nodes = append(nodes, node.NewNode(w.Name, w.Address, "worker"))
 	}
 
-	s := scheduler.GetScheduler(schedulerType)
+	s := scheduler.GetScheduler(schedulerType, logger)
 
 	return &Manager{
 		LastWorker:          0,

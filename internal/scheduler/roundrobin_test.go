@@ -11,7 +11,7 @@ import (
 // does, and returns the name of the node the scheduler landed on.
 func schedule(s Scheduler, t task.Task, nodes []node.Node) string {
 	candidates := s.SelectCandidateNodes(t, nodes)
-	scores := s.Score(t, candidates)
+	scores, _ := s.Score(t, candidates)
 	return s.Pick(scores, candidates).Name
 }
 
@@ -90,7 +90,7 @@ func TestRoundRobinSchedulerScoreGivesExactlyOneWinner(t *testing.T) {
 	r := &RoundRobinScheduler{}
 	nodes := nodesNamed("a", "b", "c")
 
-	scores := r.Score(task.Task{}, nodes)
+	scores, _ := r.Score(task.Task{}, nodes)
 
 	winners := 0
 	for name, score := range scores {
@@ -113,7 +113,7 @@ func TestRoundRobinSchedulerScoreGivesExactlyOneWinner(t *testing.T) {
 func TestRoundRobinSchedulerHandlesNoNodes(t *testing.T) {
 	r := &RoundRobinScheduler{}
 
-	scores := r.Score(task.Task{}, nil)
+	scores, _ := r.Score(task.Task{}, nil)
 	if len(scores) != 0 {
 		t.Errorf("Score with no nodes = %v, want an empty map", scores)
 	}
@@ -155,7 +155,7 @@ func TestGetSchedulerReturnsRoundRobin(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := GetScheduler(tt.schedulerType)
+			got := GetScheduler(tt.schedulerType, nil)
 			if _, ok := got.(*RoundRobinScheduler); !ok {
 				t.Errorf("GetScheduler(%q) = %T, want *RoundRobinScheduler", tt.schedulerType, got)
 			}

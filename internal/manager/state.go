@@ -223,6 +223,9 @@ func (m *Manager) pickWorker(t task.Task) (node.Node, bool) {
 		return node.Node{}, false
 	}
 
-	scores := m.Scheduler.Score(t, candidates)
+	scores, err := m.Scheduler.Score(t, candidates)
+	if err != nil {
+		return node.Node{}, false
+	}
 	return m.Scheduler.Pick(scores, candidates), true
 }
