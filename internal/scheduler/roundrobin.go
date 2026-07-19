@@ -6,7 +6,9 @@ import (
 )
 
 type RoundRobinScheduler struct {
-	Name       string
+	Name string
+	// LastWorker is the index of the node picked on the previous Score call.
+	// It is the scheduler's only state; everything else is derived from it.
 	LastWorker int
 }
 
@@ -14,35 +16,24 @@ func (r *RoundRobinScheduler) SelectCandidateNodes(t task.Task, nodes []node.Nod
 	return nodes
 }
 
+// Score advances the round-robin cursor and hands the next node the only
+// non-zero score.
 func (r *RoundRobinScheduler) Score(t task.Task, nodes []node.Node) map[string]float64 {
-	scores := make(map[string]float64)
-	var newLastWorker int
-
-	if r.LastWorker == len(nodes)-1 {
-		r.LastWorker = 0
-		newLastWorker = 0
-	} else {
-		newLastWorker = r.LastWorker + 1
-		r.LastWorker += 1
+	next := nextWorkerIndex(r.LastWorker, len(nodes))
+	if next < 0 {
+		// No nodes to score; leave the cursor where it is so the next call
+		// with a real node set resumes from it.
+		return map[string]float64{}
 	}
 
-	for idx, node := range nodes {
-		scores[node.Name] = 0.0
-		if idx == newLastWorker {
-			scores[node.Name] += 1
-		}
-	}
-
-	return scores
+	r.LastWorker = next
+	return scoreNodes(nodes, next)
 }
 
+// Pick returns the highest-scoring candidate. With no candidates there is
+// nothing to pick, so it returns the zero Node; callers are expected to have
+// rejected an empty candidate set before scoring.
 func (r *RoundRobinScheduler) Pick(scores map[string]float64, candidates []node.Node) node.Node {
-	maxNode := candidates[0]
-	for _, node := range candidates {
-		if scores[node.Name] > scores[maxNode.Name] {
-			maxNode = node
-		}
-	}
-
-	return maxNode
+	picked, _ := highestScoringNode(scores, candidates)
+	return picked
 }
