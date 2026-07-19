@@ -166,6 +166,25 @@ func newEchoServerTaskEvent(name, healthCheck string) task.TaskEvent {
 	}
 }
 
+// stopWorkerTasks stops and removes every container the worker still owns.
+// task.Docker.Stop does both, so this is all that's needed to leave the
+// docker daemon clean after a Ctrl-C.
+func stopWorkerTasks(w *worker.Worker, logger *slog.Logger) {
+	for _, t := range w.GetTasks() {
+		if t.ContainerID == "" || t.State == task.Completed {
+			continue
+		}
+		logger.Info("stopping container on shutdown", "taskID", t.ID, "containerID", t.ContainerID)
+		// StopTask expects the task to be heading for Completed; the queue
+		// normally sets that, but we're bypassing the queue here.
+		t.State = task.Completed
+		if result := w.StopTask(t); result.Error != nil {
+			logger.Error("stopping container on shutdown failed",
+				"err", result.Error, "taskID", t.ID, "containerID", t.ContainerID)
+		}
+	}
+}
+
 type UpdateValue struct {
 	Update string
 	Error  error
@@ -199,7 +218,11 @@ func doWork(done <-chan struct{}, workerNum int, logger *slog.Logger) (<-chan Up
 
 	go func() {
 		defer close(valueStream)
+		// Wait for the API and the RunTasks loop to exit first — otherwise
+		// RunTasks could start a fresh container behind our back while we're
+		// tearing them down.
 		wg.Wait()
+		stopWorkerTasks(&w, wLogger)
 		wLogger.Info("cleaning up, closing value stream")
 	}()
 
