@@ -14,6 +14,21 @@ func nodesNamed(names ...string) []node.Node {
 	return nodes
 }
 
+// nameScore is one entry for scoredNamed, kept as a pair so the tables below
+// read as "this node scored this".
+type nameScore struct {
+	name  string
+	score float64
+}
+
+func scoredNamed(entries ...nameScore) []ScoredNode {
+	scored := make([]ScoredNode, 0, len(entries))
+	for _, e := range entries {
+		scored = append(scored, ScoredNode{Node: node.Node{Name: e.name}, Score: e.score})
+	}
+	return scored
+}
+
 func TestNextWorkerIndex(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -136,9 +151,20 @@ func TestScoreNodes(t *testing.T) {
 			if len(got) != len(tt.want) {
 				t.Fatalf("scoreNodes(%v, %d) = %v, want %v", tt.nodes, tt.selected, got, tt.want)
 			}
-			for name, wantScore := range tt.want {
-				if got[name] != wantScore {
-					t.Errorf("score for %q = %v, want %v (full map %v)", name, got[name], wantScore, got)
+			// Order follows the input, so the result can be read positionally.
+			for i, s := range got {
+				wantScore, ok := tt.want[s.Node.Name]
+				if !ok {
+					t.Errorf("unexpected node %q in result", s.Node.Name)
+					continue
+				}
+				if s.Score != wantScore {
+					t.Errorf("score for %q = %v, want %v (full result %v)",
+						s.Node.Name, s.Score, wantScore, got)
+				}
+				if s.Node.Name != tt.nodes[i].Name {
+					t.Errorf("result[%d] is %q, want %q — order must follow the input",
+						i, s.Node.Name, tt.nodes[i].Name)
 				}
 			}
 		})
@@ -147,144 +173,136 @@ func TestScoreNodes(t *testing.T) {
 
 func TestHighestScoringNode(t *testing.T) {
 	tests := []struct {
-		name       string
-		scores     map[string]float64
-		candidates []node.Node
-		wantName   string
-		wantOK     bool
+		name     string
+		scored   []ScoredNode
+		wantName string
+		wantOK   bool
 	}{
 		{
-			name:       "picks the only node with a non-zero score",
-			scores:     map[string]float64{"a": 0, "b": 1, "c": 0},
-			candidates: nodesNamed("a", "b", "c"),
-			wantName:   "b",
-			wantOK:     true,
+			name:     "picks the only node with a non-zero score",
+			scored:   scoredNamed(nameScore{"a", 0}, nameScore{"b", 1}, nameScore{"c", 0}),
+			wantName: "b",
+			wantOK:   true,
 		},
 		{
-			name:       "picks the winner when it is first in the slice",
-			scores:     map[string]float64{"a": 1, "b": 0},
-			candidates: nodesNamed("a", "b"),
-			wantName:   "a",
-			wantOK:     true,
+			name:     "picks the winner when it is first in the slice",
+			scored:   scoredNamed(nameScore{"a", 1}, nameScore{"b", 0}),
+			wantName: "a",
+			wantOK:   true,
 		},
 		{
-			name:       "a tie goes to the earliest candidate",
-			scores:     map[string]float64{"a": 1, "b": 1},
-			candidates: nodesNamed("a", "b"),
-			wantName:   "a",
-			wantOK:     true,
+			name:     "a tie goes to the earliest entry",
+			scored:   scoredNamed(nameScore{"a", 1}, nameScore{"b", 1}),
+			wantName: "a",
+			wantOK:   true,
 		},
 		{
-			name:       "candidates missing from the scores are treated as zero",
-			scores:     map[string]float64{"b": 1},
-			candidates: nodesNamed("a", "b"),
-			wantName:   "b",
-			wantOK:     true,
+			// The old "missing from the scores is treated as zero" case is gone:
+			// a node with no score cannot be built as a ScoredNode, so the
+			// scheduler that omits it simply hands over a shorter slice.
+			name:     "an omitted node is absent rather than scored zero",
+			scored:   scoredNamed(nameScore{"b", 1}),
+			wantName: "b",
+			wantOK:   true,
 		},
 		{
-			name:       "all scores zero still returns the first candidate",
-			scores:     map[string]float64{"a": 0, "b": 0},
-			candidates: nodesNamed("a", "b"),
-			wantName:   "a",
-			wantOK:     true,
+			name:     "all scores zero still returns the first entry",
+			scored:   scoredNamed(nameScore{"a", 0}, nameScore{"b", 0}),
+			wantName: "a",
+			wantOK:   true,
 		},
 		{
-			name:       "no candidates yields no node",
-			scores:     map[string]float64{"a": 1},
-			candidates: nil,
-			wantOK:     false,
+			name:   "nothing scored yields no node",
+			scored: nil,
+			wantOK: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := highestScoringNode(tt.scores, tt.candidates)
+			got, ok := highestScoringNode(tt.scored)
 			if ok != tt.wantOK {
 				t.Fatalf("highestScoringNode(...) ok = %v, want %v", ok, tt.wantOK)
 			}
 			if ok && got.Name != tt.wantName {
-				t.Errorf("highestScoringNode(%v, %v) = %q, want %q",
-					tt.scores, tt.candidates, got.Name, tt.wantName)
+				t.Errorf("highestScoringNode(%v) = %q, want %q",
+					tt.scored, got.Name, tt.wantName)
 			}
 		})
 	}
 }
 
-// TestHighestScoringNodeDoesNotMutateCandidates guards the value semantics: the
+// TestHighestScoringNodeDoesNotMutateItsInput guards the value semantics: the
 // caller's slice is read-only here and must come back untouched.
-func TestHighestScoringNodeDoesNotMutateCandidates(t *testing.T) {
-	candidates := nodesNamed("a", "b", "c")
-	scores := map[string]float64{"a": 0, "b": 1, "c": 0}
+func TestHighestScoringNodeDoesNotMutateItsInput(t *testing.T) {
+	scored := scoredNamed(nameScore{"a", 0}, nameScore{"b", 1}, nameScore{"c", 0})
 
-	highestScoringNode(scores, candidates)
+	highestScoringNode(scored)
 
 	for idx, want := range []string{"a", "b", "c"} {
-		if candidates[idx].Name != want {
-			t.Errorf("candidates[%d].Name = %q, want %q", idx, candidates[idx].Name, want)
+		if scored[idx].Node.Name != want {
+			t.Errorf("scored[%d].Node.Name = %q, want %q", idx, scored[idx].Node.Name, want)
 		}
 	}
 }
 
 func TestLowestScoringNode(t *testing.T) {
 	tests := []struct {
-		name       string
-		scores     map[string]float64
-		candidates []node.Node
-		wantName   string
-		wantOK     bool
+		name     string
+		scored   []ScoredNode
+		wantName string
+		wantOK   bool
 	}{
 		{
-			name:       "picks the cheapest node",
-			scores:     map[string]float64{"a": 0.9, "b": 0.2, "c": 0.5},
-			candidates: nodesNamed("a", "b", "c"),
-			wantName:   "b",
-			wantOK:     true,
+			name:     "picks the cheapest node",
+			scored:   scoredNamed(nameScore{"a", 0.9}, nameScore{"b", 0.2}, nameScore{"c", 0.5}),
+			wantName: "b",
+			wantOK:   true,
 		},
 		{
-			name:       "picks the winner when it is first in the slice",
-			scores:     map[string]float64{"a": 0.1, "b": 0.8},
-			candidates: nodesNamed("a", "b"),
-			wantName:   "a",
-			wantOK:     true,
+			name:     "picks the winner when it is first in the slice",
+			scored:   scoredNamed(nameScore{"a", 0.1}, nameScore{"b", 0.8}),
+			wantName: "a",
+			wantOK:   true,
 		},
 		{
-			name:       "a tie goes to the earliest candidate",
-			scores:     map[string]float64{"a": 0.5, "b": 0.5},
-			candidates: nodesNamed("a", "b"),
-			wantName:   "a",
-			wantOK:     true,
+			name:     "a tie goes to the earliest entry",
+			scored:   scoredNamed(nameScore{"a", 0.5}, nameScore{"b", 0.5}),
+			wantName: "a",
+			wantOK:   true,
 		},
 		{
-			name:       "candidates missing from the scores are treated as zero",
-			scores:     map[string]float64{"a": 0.5},
-			candidates: nodesNamed("a", "b"),
-			wantName:   "b",
-			wantOK:     true,
+			// The dangerous case under the old map API: an unreachable node had
+			// no entry, read as zero — the cheapest cost — and beat every
+			// healthy node. It is now unrepresentable, because a node without a
+			// score cannot be built as a ScoredNode at all.
+			name:     "an unreachable node is simply absent, not the cheapest",
+			scored:   scoredNamed(nameScore{"a", 0.5}),
+			wantName: "a",
+			wantOK:   true,
 		},
 		{
-			name:       "negative scores are still comparable",
-			scores:     map[string]float64{"a": -0.1, "b": 0.4},
-			candidates: nodesNamed("a", "b"),
-			wantName:   "a",
-			wantOK:     true,
+			name:     "negative scores are still comparable",
+			scored:   scoredNamed(nameScore{"a", -0.1}, nameScore{"b", 0.4}),
+			wantName: "a",
+			wantOK:   true,
 		},
 		{
-			name:       "no candidates yields no node",
-			scores:     map[string]float64{"a": 1},
-			candidates: nil,
-			wantOK:     false,
+			name:   "nothing scored yields no node",
+			scored: nil,
+			wantOK: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := lowestScoringNode(tt.scores, tt.candidates)
+			got, ok := lowestScoringNode(tt.scored)
 			if ok != tt.wantOK {
 				t.Fatalf("lowestScoringNode(...) ok = %v, want %v", ok, tt.wantOK)
 			}
 			if ok && got.Name != tt.wantName {
-				t.Errorf("lowestScoringNode(%v, %v) = %q, want %q",
-					tt.scores, tt.candidates, got.Name, tt.wantName)
+				t.Errorf("lowestScoringNode(%v) = %q, want %q",
+					tt.scored, got.Name, tt.wantName)
 			}
 		})
 	}
@@ -294,11 +312,10 @@ func TestLowestScoringNode(t *testing.T) {
 // schedulers depend on: round-robin scores a winner high, marginal cost scores
 // a winner low. Reusing the wrong helper picks the worst node every time.
 func TestLowestScoringNodeIsTheInverseOfHighest(t *testing.T) {
-	scores := map[string]float64{"a": 0.1, "b": 0.9}
-	candidates := nodesNamed("a", "b")
+	scored := scoredNamed(nameScore{"a", 0.1}, nameScore{"b", 0.9})
 
-	low, _ := lowestScoringNode(scores, candidates)
-	high, _ := highestScoringNode(scores, candidates)
+	low, _ := lowestScoringNode(scored)
+	high, _ := highestScoringNode(scored)
 
 	if low.Name == high.Name {
 		t.Fatalf("lowest and highest both picked %q, want opposite nodes", low.Name)

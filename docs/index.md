@@ -13,6 +13,7 @@ Follow these when writing code.
 | --- | --- |
 | [`error-handling-and-logging.md`](error-handling-and-logging.md) | **Read before writing any error or log line.** Per-package error types (`TaskError`/`WorkerError`/`ManagerError`), the `E`-at-the-boundary / `Wrap`-above-it rule, one-log-per-error, `slog` child loggers and attribute keys, and the `internal/httpapi` helpers for HTTP responses. |
 | [`code-structure-and-testing.md`](code-structure-and-testing.md) | How to split pure functions and business logic out of framework plumbing, when a buried block is worth extracting, and what to test at each layer. Table-driven test conventions and the `go build` / `go vet` / `gofmt` checks a change is expected to pass. |
+| [`concurrency-and-state.md`](concurrency-and-state.md) | **Read before touching either `state.go`, or the scheduler.** Why both packages put all mutable state behind helpers, the four helper categories and which package uses which, the `upsertTask` pattern for read-modify-writes with I/O in the middle, the `Locked` suffix convention, and how to race-test a new helper. Also covers scheduling: why `pickWorker` takes no lock, why per-index slice writes need no mutex when map writes do, and why a node is paired with its score. |
 
 ## Reference — where the project could go next
 

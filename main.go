@@ -16,6 +16,7 @@ import (
 	"github.com/moby/moby/api/types/network"
 	"github.com/nickstrad/task-orchestrator/internal/manager"
 	"github.com/nickstrad/task-orchestrator/internal/scheduler"
+	"github.com/nickstrad/task-orchestrator/internal/store"
 	"github.com/nickstrad/task-orchestrator/internal/task"
 	"github.com/nickstrad/task-orchestrator/internal/worker"
 )
@@ -73,7 +74,7 @@ func main() {
 			workers = append(workers, <-workerStream)
 		}
 		mLogger := logger.With("component", "manager", "addr", mAddr)
-		m := manager.NewManager(workers, scheduler.MarginalCost, mLogger)
+		m := manager.NewManager(workers, scheduler.MarginalCost, mLogger, store.InMemoryDb)
 		api := manager.NewAPI(mHost, mPort, m, mLogger)
 		go api.Start(done)
 		go api.Manager.UpdateTasks(done)
@@ -170,7 +171,16 @@ func newEchoServerTaskEvent(name, healthCheck string) task.TaskEvent {
 // task.Docker.Stop does both, so this is all that's needed to leave the
 // docker daemon clean after a Ctrl-C.
 func stopWorkerTasks(w *worker.Worker, logger *slog.Logger) {
-	for _, t := range w.GetTasks() {
+	tasks, err := w.GetTasks()
+	if err != nil {
+		// Shutdown path: log and move on. Failing to enumerate tasks leaves
+		// containers running, which is worth saying out loud, but there is no
+		// recovery to attempt with the process already on its way down.
+		logger.Error("cannot stop worker tasks: listing tasks failed", "err", err)
+		return
+	}
+
+	for _, t := range tasks {
 		if t.ContainerID == "" || t.State == task.Completed {
 			continue
 		}
@@ -203,7 +213,7 @@ func doWork(done <-chan struct{}, workerNum int, logger *slog.Logger) (<-chan Up
 	workerAddr := fmt.Sprintf("http://%s:%d", host, port)
 	wLogger := logger.With("component", workerName, "workerID", workerNum, "addr", workerAddr)
 	wLogger.Info("listening")
-	w := worker.NewWorker(workerName, workerNum, wLogger)
+	w := worker.NewWorker(workerName, workerNum, wLogger, store.InMemoryDb)
 	go w.CollectStats(done)
 	api := worker.NewAPI(&w, host, port, wLogger)
 	wg.Go(func() {

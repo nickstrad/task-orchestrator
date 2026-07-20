@@ -1,11 +1,13 @@
 package manager
 
 import (
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/moby/moby/api/types/network"
+	"github.com/nickstrad/task-orchestrator/internal/store"
 	"github.com/nickstrad/task-orchestrator/internal/task"
 )
 
@@ -360,14 +362,15 @@ func TestMergeTaskUpdateKeepsWorkerFieldsOnARejectedTransition(t *testing.T) {
 func TestRetireTaskDropsRoutingButKeepsTheRecord(t *testing.T) {
 	id, other := uuid.New(), uuid.New()
 	m := &Manager{
-		TaskDb:        map[uuid.UUID]task.Task{id: {ID: id, State: task.Running}},
+		TaskDb:        newSeededTaskStore(t, task.Task{ID: id, State: task.Running}),
+		logger:        slog.New(slog.DiscardHandler),
 		TaskWorkerMap: map[uuid.UUID]string{id: "worker-1"},
 		WorkerTaskMap: map[string][]uuid.UUID{"worker-1": {other, id}},
 	}
 
 	m.retireTask("worker-1", id)
 
-	if got := m.TaskDb[id].State; got != task.Completed {
+	if got := getTask(t, m, id).State; got != task.Completed {
 		t.Errorf("TaskDb state = %v, want %v", got, task.Completed)
 	}
 	if _, ok := m.TaskWorkerMap[id]; ok {
@@ -384,7 +387,8 @@ func TestRetireTaskDropsRoutingButKeepsTheRecord(t *testing.T) {
 func TestRetireTaskLeavesOtherWorkersAlone(t *testing.T) {
 	id := uuid.New()
 	m := &Manager{
-		TaskDb:        map[uuid.UUID]task.Task{id: {ID: id, State: task.Running}},
+		TaskDb:        newSeededTaskStore(t, task.Task{ID: id, State: task.Running}),
+		logger:        slog.New(slog.DiscardHandler),
 		TaskWorkerMap: map[uuid.UUID]string{id: "worker-1"},
 		WorkerTaskMap: map[string][]uuid.UUID{"worker-1": {id}},
 	}
@@ -398,4 +402,17 @@ func TestRetireTaskLeavesOtherWorkersAlone(t *testing.T) {
 	if got, ok := m.WorkerTaskMap["worker-1"]; !ok || len(got) != 0 {
 		t.Errorf("WorkerTaskMap[worker-1] = %v (present=%v), want empty", got, ok)
 	}
+}
+
+// newSeededTaskStore builds a task store pre-populated with tasks, for tests
+// that construct a Manager literal instead of going through NewManager.
+func newSeededTaskStore(t *testing.T, tasks ...task.Task) store.Store[task.Task] {
+	t.Helper()
+	db := store.NewInMemory[task.Task]()
+	for _, tk := range tasks {
+		if err := db.Put(tk.ID.String(), tk); err != nil {
+			t.Fatalf("seeding task %s: %v", tk.ID, err)
+		}
+	}
+	return db
 }

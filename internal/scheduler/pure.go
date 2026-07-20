@@ -37,58 +37,53 @@ func nextWorkerIndex(lastWorker, nodeCount int) int {
 }
 
 // scoreNodes gives the node at index selected a score of 1 and every other node
-// a score of 0. Nodes not at selected are still present in the map: Pick reads
-// scores by name, and a missing key would be indistinguishable from a zero.
-func scoreNodes(nodes []node.Node, selected int) map[string]float64 {
-	scores := make(map[string]float64, len(nodes))
+// a score of 0.
+func scoreNodes(nodes []node.Node, selected int) []ScoredNode {
+	scored := make([]ScoredNode, 0, len(nodes))
 	for idx, n := range nodes {
+		score := 0.0
 		if idx == selected {
-			scores[n.Name] = 1.0
-			continue
+			score = 1.0
 		}
-		scores[n.Name] = 0.0
+		scored = append(scored, ScoredNode{Node: n, Score: score})
 	}
-	return scores
+	return scored
 }
 
-// highestScoringNode returns the candidate with the greatest score, and whether
-// there was one at all. Ties go to the earliest candidate in the slice, so the
-// result does not depend on map iteration order.
-//
-// A candidate missing from scores is treated as scoring zero, which is what the
-// bare map lookup did before.
-func highestScoringNode(scores map[string]float64, candidates []node.Node) (node.Node, bool) {
-	if len(candidates) == 0 {
+// highestScoringNode returns the entry with the greatest score, and whether
+// there was one at all. Ties go to the earliest entry in the slice.
+func highestScoringNode(scored []ScoredNode) (node.Node, bool) {
+	if len(scored) == 0 {
 		return node.Node{}, false
 	}
 
-	best := candidates[0]
-	for _, n := range candidates[1:] {
-		if scores[n.Name] > scores[best.Name] {
-			best = n
+	best := scored[0]
+	for _, s := range scored[1:] {
+		if s.Score > best.Score {
+			best = s
 		}
 	}
-	return best, true
+	return best.Node, true
 }
 
-// lowestScoringNode returns the candidate with the smallest score, and whether
-// there was one at all. Marginal-cost scoring is the inverse of round-robin's:
-// the score is what placing the task *costs*, so the cheapest node wins.
+// lowestScoringNode returns the entry with the smallest score, and whether there
+// was one at all. Marginal-cost scoring is the inverse of round-robin's: the
+// score is what placing the task *costs*, so the cheapest node wins.
 //
-// Ties go to the earliest candidate, and a candidate missing from scores is
-// treated as scoring zero — the same conventions highestScoringNode uses.
-func lowestScoringNode(scores map[string]float64, candidates []node.Node) (node.Node, bool) {
-	if len(candidates) == 0 {
+// Ties go to the earliest entry. There is no missing-value case to handle — an
+// unscored node cannot be represented as a ScoredNode.
+func lowestScoringNode(scored []ScoredNode) (node.Node, bool) {
+	if len(scored) == 0 {
 		return node.Node{}, false
 	}
 
-	best := candidates[0]
-	for _, n := range candidates[1:] {
-		if scores[n.Name] < scores[best.Name] {
-			best = n
+	best := scored[0]
+	for _, s := range scored[1:] {
+		if s.Score < best.Score {
+			best = s
 		}
 	}
-	return best, true
+	return best.Node, true
 }
 
 const (

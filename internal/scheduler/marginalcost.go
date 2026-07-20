@@ -1,7 +1,9 @@
 package scheduler
 
 import (
+	"errors"
 	"log/slog"
+	"sync"
 
 	"github.com/nickstrad/task-orchestrator/internal/node"
 	"github.com/nickstrad/task-orchestrator/internal/task"
@@ -35,42 +37,95 @@ func (e *MarginalCostScheduler) SelectCandidateNodes(t task.Task, nodes []node.N
 	return candidates
 }
 
-func (e *MarginalCostScheduler) Score(t task.Task, candidates []node.Node) (map[string]float64, error) {
+func (e *MarginalCostScheduler) Score(t task.Task, candidates []node.Node) ([]ScoredNode, error) {
 	op := "scheduler.MarginalCostScheduler.Score"
 
-	scores := make(map[string]float64)
-	for _, n := range candidates {
-		// One fetch per node: cpu, memory and task count all come from the
-		// same snapshot, so the terms below describe a single moment in time.
-		stats, err := n.GetStats()
-		if err != nil {
-			return nil, Wrap(op, "scoring node "+n.Name, err)
-		}
+	// One slot per candidate, each written only by that candidate's goroutine.
+	// This is the natural partition a map could not provide: distinct slice
+	// indices are distinct memory, the slice header is never written, and
+	// nothing reallocates — so these writes need no lock. A map shares its
+	// count, its buckets and its growth between all keys, which is why the
+	// earlier map version did.
+	//
+	// results[i] is meaningful only when scored[i] is true.
+	results := make([]ScoredNode, len(candidates))
+	scored := make([]bool, len(candidates))
 
-		load := nodeLoad{
-			// n.MemoryAllocated is the manager's own bookkeeping of what it
-			// has placed but the worker may not have started yet. Nothing
-			// writes it today, so this is currently just the live usage.
-			MemUsed:   float64(stats.MemUsedKb()) + float64(n.MemoryAllocated),
-			MemTotal:  float64(stats.MemTotalKb()),
-			CPULoad:   e.cpuLoad(n, stats),
-			TaskCount: float64(stats.TaskCount),
-		}
+	var wg sync.WaitGroup
+	// One slot per candidate, so no goroutine can ever block on a send. Nothing
+	// drains this channel until wg.Wait() returns, so a buffer smaller than the
+	// number of possible sends deadlocks: the senders that do not fit park
+	// forever, and Wait never returns to start the drain.
+	errsStream := make(chan error, len(candidates))
+	for i, n := range candidates {
+		wg.Go(func() {
+			// One fetch per node: cpu, memory and task count all come from the
+			// same snapshot, so the terms below describe a single moment in time.
+			stats, err := n.GetStats()
+			if err != nil {
+				errsStream <- Wrap(op, "scoring node "+n.Name, err)
+				return
+			}
 
-		score, err := nodeScore(load, float64(t.Memory))
-		if err != nil {
-			return nil, E(op, "scoring node "+n.Name, err)
-		}
-		scores[n.Name] = score
+			load := nodeLoad{
+				// n.MemoryAllocated is the manager's own bookkeeping of what it
+				// has placed but the worker may not have started yet. Nothing
+				// writes it today, so this is currently just the live usage.
+				MemUsed:   float64(stats.MemUsedKb()) + float64(n.MemoryAllocated),
+				MemTotal:  float64(stats.MemTotalKb()),
+				CPULoad:   e.cpuLoad(n, stats),
+				TaskCount: float64(stats.TaskCount),
+			}
+
+			score, err := nodeScore(load, float64(t.Memory))
+			if err != nil {
+				errsStream <- E(op, "scoring node "+n.Name, err)
+				return
+			}
+			results[i] = ScoredNode{Node: n, Score: score}
+			scored[i] = true
+		})
 	}
 
-	return scores, nil
+	wg.Wait()
+	close(errsStream)
+	errs := make([]error, 0, len(candidates))
+	for err := range errsStream {
+		errs = append(errs, err)
+	}
+
+	// Compacted in candidate order, so ties break the same way every run rather
+	// than by goroutine completion order.
+	out := make([]ScoredNode, 0, len(candidates))
+	for i := range candidates {
+		if scored[i] {
+			out = append(out, results[i])
+		}
+	}
+
+	// A partial result is still a usable one: refusing to place a task because
+	// some OTHER node is unreachable takes the whole cluster down with one bad
+	// worker. Score fails only when it has nothing at all to offer.
+	if len(out) == 0 && len(errs) > 0 {
+		return nil, errors.Join(errs...)
+	}
+
+	if len(errs) > 0 {
+		// Terminal consumer for these: the caller is getting a usable result and
+		// will never see them, so they are logged once here or not at all. The
+		// task still lands on the best of whatever answered.
+		e.logger.Warn("scoring skipped unreachable candidates",
+			"err", errors.Join(errs...),
+			"failed", len(errs), "scored", len(out))
+	}
+
+	return out, nil
 }
 
-// Pick returns the cheapest candidate. Scores here are costs, so this is the
+// Pick returns the cheapest entry. Scores here are costs, so this is the
 // opposite of the round-robin scheduler's highest-wins rule.
-func (e *MarginalCostScheduler) Pick(scores map[string]float64, candidates []node.Node) node.Node {
-	picked, _ := lowestScoringNode(scores, candidates)
+func (e *MarginalCostScheduler) Pick(scored []ScoredNode) node.Node {
+	picked, _ := lowestScoringNode(scored)
 	return picked
 }
 

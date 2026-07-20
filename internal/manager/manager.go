@@ -15,6 +15,7 @@ import (
 	"github.com/nickstrad/task-orchestrator/internal/node"
 	"github.com/nickstrad/task-orchestrator/internal/queue"
 	"github.com/nickstrad/task-orchestrator/internal/scheduler"
+	"github.com/nickstrad/task-orchestrator/internal/store"
 	"github.com/nickstrad/task-orchestrator/internal/task"
 )
 
@@ -41,8 +42,8 @@ const (
 type Manager struct {
 	mu            sync.RWMutex
 	Pending       *queue.Queue[task.TaskEvent]
-	TaskDb        map[uuid.UUID]task.Task
-	EventDb       map[uuid.UUID]task.TaskEvent
+	TaskDb        store.Store[task.Task]
+	EventDb       store.Store[task.TaskEvent]
 	WorkerTaskMap map[string][]uuid.UUID
 	TaskWorkerMap map[uuid.UUID]string
 	WorkerNodes   []node.Node
@@ -65,7 +66,7 @@ type WorkerMetadata struct {
 	Address string
 }
 
-func NewManager(workers []WorkerMetadata, schedulerType string, logger *slog.Logger) *Manager {
+func NewManager(workers []WorkerMetadata, schedulerType string, logger *slog.Logger, dbType string) *Manager {
 	workerTaskMap := make(map[string][]uuid.UUID)
 
 	nodes := make([]node.Node, 0, len(workers))
@@ -76,10 +77,11 @@ func NewManager(workers []WorkerMetadata, schedulerType string, logger *slog.Log
 
 	s := scheduler.GetScheduler(schedulerType, logger)
 
+	dbs := store.GetDbs(dbType)
 	return &Manager{
 		Pending:             queue.New[task.TaskEvent](),
-		TaskDb:              make(map[uuid.UUID]task.Task),
-		EventDb:             make(map[uuid.UUID]task.TaskEvent),
+		TaskDb:              dbs.TaskDb,
+		EventDb:             dbs.TaskEventDb,
 		WorkerTaskMap:       workerTaskMap,
 		TaskWorkerMap:       make(map[uuid.UUID]string),
 		Scheduler:           s,
@@ -300,7 +302,14 @@ func (m *Manager) SendWork() {
 		return
 	}
 
-	m.putTask(newTask)
+	// The worker has the task either way. If this write is lost the manager
+	// forgets a task that is running, so every later worker report for it is
+	// rejected as unknown — worth an Error, but there is nothing to roll back.
+	if err := m.putTask(newTask); err != nil {
+		m.logger.Error("task sent but not recorded in task db",
+			"err", err, "taskID", newTask.ID, "worker", workerName)
+		return
+	}
 	m.logger.Info("task sent to worker", "taskID", newTask.ID, "state", newTask.State)
 }
 
@@ -308,8 +317,12 @@ func (m *Manager) AddTask(taskEvent task.TaskEvent) {
 	m.enqueueEvent(taskEvent)
 }
 
-func (m *Manager) GetTasks() []task.Task {
-	return m.snapshotTasks()
+func (m *Manager) GetTasks() ([]task.Task, error) {
+	tasks, err := m.snapshotTasks()
+	if err != nil {
+		return nil, Wrap("manager.GetTasks", "snapshotting tasks", err)
+	}
+	return tasks, nil
 }
 
 func (m *Manager) checkTaskHealth(t task.Task) error {
@@ -351,7 +364,15 @@ func (m *Manager) checkTaskHealth(t task.Task) error {
 }
 
 func (m *Manager) doHealthChecks() {
-	for _, t := range m.GetTasks() {
+	tasks, err := m.GetTasks()
+	if err != nil {
+		// Top of a loop goroutine: nobody above can act on this, so it is
+		// logged here and the pass is skipped. The next tick retries.
+		m.logger.Error("skipping health check pass: listing tasks failed", "err", err)
+		return
+	}
+
+	for _, t := range tasks {
 		switch decideHealthAction(t) {
 		case healthSkipNotEligible:
 			m.logger.Debug("skipping health check: task not running or failed",

@@ -11,13 +11,14 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nickstrad/task-orchestrator/internal/httpapi"
+	"github.com/nickstrad/task-orchestrator/internal/store"
 	"github.com/nickstrad/task-orchestrator/internal/task"
 )
 
 func newTestAPI(t *testing.T) *API {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	w := NewWorker("worker-test", 0, logger)
+	w := NewWorker("worker-test", 0, logger, store.InMemoryDb)
 	api := NewAPI(&w, "localhost", 0, logger)
 	api.initRouter()
 	return &api
@@ -62,7 +63,10 @@ func TestStopTaskHandlerUnknownTask(t *testing.T) {
 func TestStopTaskHandlerExistingTaskReturns204WithNoBody(t *testing.T) {
 	api := newTestAPI(t)
 	existing := task.Task{ID: uuid.New(), State: task.Running, ContainerID: "abc123"}
-	api.Worker.Db[existing.ID] = existing
+	// Seed through the state helper rather than Db directly: state.go owns every
+	// access to Db, and a test that reaches around it is the first place that
+	// convention rots.
+	api.Worker.putTask(existing)
 
 	req := httptest.NewRequest(http.MethodDelete, "/tasks/"+existing.ID.String()+"/", nil)
 	rec := httptest.NewRecorder()

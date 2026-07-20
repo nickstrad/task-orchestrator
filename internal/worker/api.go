@@ -49,7 +49,16 @@ func (a *API) StartTaskHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) GetTasksHandler(w http.ResponseWriter, r *http.Request) {
-	httpapi.WriteJSON(w, http.StatusOK, a.Worker.GetTasks())
+	tasks, err := a.Worker.GetTasks()
+	if err != nil {
+		// This is the manager's only view of the worker, so a 500 here is what
+		// makes the manager log "worker returned unexpected status" rather than
+		// silently merging an empty task list.
+		a.logger.Error("listing tasks failed", "err", err)
+		httpapi.WriteError(w, http.StatusInternalServerError, "could not list tasks")
+		return
+	}
+	httpapi.WriteJSON(w, http.StatusOK, tasks)
 }
 
 func (a *API) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
@@ -60,9 +69,15 @@ func (a *API) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	parsedTaskID, _ := uuid.Parse(taskID)
+	parsedTaskID, err := uuid.Parse(taskID)
+	if err != nil {
+		a.logger.Warn("unparseable taskID in request", "taskID", taskID,
+			"err", E("worker.API.StopTaskHandler", "parsing taskID", err))
+		httpapi.WriteError(w, http.StatusBadRequest, "taskID is not a valid uuid")
+		return
+	}
 
-	taskToStop, ok := a.Worker.Db[parsedTaskID]
+	taskToStop, ok := a.Worker.LookupTask(parsedTaskID)
 	if !ok {
 		a.logger.Warn("task does not exist on worker", "taskID", taskID)
 		httpapi.WriteError(w, http.StatusNotFound, "task does not exist on worker")
@@ -80,7 +95,16 @@ func (a *API) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) GetStatsHandler(w http.ResponseWriter, r *http.Request) {
-	httpapi.WriteJSON(w, http.StatusOK, a.Worker.Stats)
+	stats, ok := a.Worker.SnapshotStats()
+	if !ok {
+		// CollectStats has not completed a pass yet. Reading the field
+		// directly used to serialise a nil here as "null"; a 503 says the same
+		// thing in a way the caller can act on.
+		a.logger.Warn("stats requested before first collection")
+		httpapi.WriteError(w, http.StatusServiceUnavailable, "stats not collected yet")
+		return
+	}
+	httpapi.WriteJSON(w, http.StatusOK, stats)
 }
 
 func (a *API) initRouter() {

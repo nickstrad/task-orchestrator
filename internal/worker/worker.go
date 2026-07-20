@@ -3,31 +3,46 @@ package worker
 import (
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
+
 	"github.com/nickstrad/task-orchestrator/internal/queue"
+	"github.com/nickstrad/task-orchestrator/internal/store"
 	"github.com/nickstrad/task-orchestrator/internal/task"
 )
 
 type Worker struct {
-	Name      string
-	ID        int
-	Db        map[uuid.UUID]task.Task
-	Queue     *queue.Queue[task.Task]
-	TaskCount int
-	Stats     *Stats
-	logger    *slog.Logger
+	// mu guards Db, Queue, and Stats. Every access goes through a helper in
+	// state.go; see docs/concurrency-and-state.md.
+	mu sync.RWMutex
+
+	Name   string
+	ID     int
+	Db     store.Store[task.Task]
+	Queue  *queue.Queue[task.Task]
+	Stats  *Stats
+	logger *slog.Logger
 }
 
-func NewWorker(name string, id int, logger *slog.Logger) Worker {
+func NewWorker(name string, id int, logger *slog.Logger, dbType string) Worker {
+
+	dbs := store.GetDbs(dbType)
+
 	return Worker{
 		Name:   name,
 		ID:     id,
-		Db:     make(map[uuid.UUID]task.Task),
+		Db:     dbs.TaskDb,
 		Queue:  queue.New[task.Task](),
 		logger: logger,
 	}
+}
+
+// LookupTask is lookupTask for callers outside this package — the API needs it
+// to answer a stop request for a task the worker may not have.
+func (w *Worker) LookupTask(id uuid.UUID) (task.Task, bool) {
+	return w.lookupTask(id)
 }
 
 func (w *Worker) CollectStats(done <-chan struct{}) {
@@ -38,23 +53,29 @@ func (w *Worker) CollectStats(done <-chan struct{}) {
 		default:
 		}
 		w.logger.Debug("collecting stats")
-		w.Stats = NewStats(w.logger)
-		w.Stats.TaskCount = w.TaskCount
+		stats := NewStats(w.logger)
+		// TaskCount used to come from a Worker field that nothing ever
+		// incremented, so this always reported zero. Asking the store means it
+		// cannot drift out of step with reality again.
+		stats.TaskCount = w.taskCount()
+		w.setStats(stats)
 		time.Sleep(time.Second * 15)
 	}
 }
 
 func (w *Worker) RunTask() task.DockerResult {
-	taskQueued, ok := w.Queue.Dequeue()
+	taskQueued, ok := w.dequeueTask()
 	if !ok {
 		return task.NewDockerResult(E("worker.RunTask", "no tasks in the queue", nil), "", "", "")
 	}
 
-	taskPersisted, exists := w.Db[taskQueued.ID]
+	taskPersisted, exists := w.lookupTask(taskQueued.ID)
 
 	if !exists {
+		// Category 2: nothing else can hold a version of a task the store has
+		// never seen, so a whole-value write is safe here.
 		taskPersisted = taskQueued
-		w.Db[taskQueued.ID] = taskQueued
+		w.putTask(taskQueued)
 	}
 
 	stateMachine := task.NewStateMachine()
@@ -79,20 +100,31 @@ func (w *Worker) RunTask() task.DockerResult {
 }
 
 func (w *Worker) StartTask(t task.Task) task.DockerResult {
-	t.StartTime = time.Now().UTC()
+	startTime := time.Now().UTC()
+	hostPorts := t.HostPorts
+
+	// Every write below follows a Docker call, so each is a category-4 merge
+	// applying only the fields StartTask owns. See docs/concurrency-and-state.md.
+	// The merge callback is the only writer of those fields — mutating the local
+	// t as well would be a second copy of the same decision to keep in step.
+	fail := func() {
+		w.upsertTask(t, func(p *task.Task) {
+			p.StartTime = startTime
+			p.State = task.Failed
+		})
+	}
+
 	config := task.NewConfig(t)
 	dockerHandler, err := task.NewDocker(config)
 	if err != nil {
-		t.State = task.Failed
-		w.Db[t.ID] = t
+		fail()
 		return task.NewDockerResult(Wrap("worker.StartTask", "creating docker handler", err), "", "", "")
 	}
 
 	if t.ContainerID != "" {
 		dockerResult := dockerHandler.Stop(t.ContainerID)
 		if dockerResult.Error != nil {
-			t.State = task.Failed
-			w.Db[t.ID] = t
+			fail()
 			return task.NewDockerResult(Wrap("worker.StartTask", fmt.Sprintf("stopping existing container %s for task %s", t.ContainerID, t.ID), dockerResult.Error), "", "", "")
 		}
 	}
@@ -100,8 +132,7 @@ func (w *Worker) StartTask(t task.Task) task.DockerResult {
 	result := dockerHandler.Run()
 
 	if result.Error != nil {
-		t.State = task.Failed
-		w.Db[t.ID] = t
+		fail()
 		result.Error = Wrap("worker.StartTask", fmt.Sprintf("starting task %s", t.ID), result.Error)
 		return result
 	}
@@ -109,21 +140,23 @@ func (w *Worker) StartTask(t task.Task) task.DockerResult {
 	if result.Result == "success" {
 		inspectResult := dockerHandler.Inspect(result.ContainerId)
 		if inspectResult.Error != nil {
-			t.State = task.Failed
-			w.Db[t.ID] = t
+			fail()
 			result.Error = Wrap("worker.StartTask", fmt.Sprintf("inspecting container %s for task %s", result.ContainerId, t.ID), inspectResult.Error)
 			return result
 		}
 
 		if inspectResult.Container.Container.NetworkSettings.Ports != nil {
-			t.HostPorts = inspectResult.Container.Container.NetworkSettings.Ports
+			hostPorts = inspectResult.Container.Container.NetworkSettings.Ports
 		}
 	}
 
-	t.ContainerID = result.ContainerId
-	t.State = task.Running
-	w.Db[t.ID] = t
-	w.logger.Info("container started", "taskID", t.ID, "containerID", t.ContainerID, "image", t.Image)
+	w.upsertTask(t, func(p *task.Task) {
+		p.StartTime = startTime
+		p.ContainerID = result.ContainerId
+		p.HostPorts = hostPorts
+		p.State = task.Running
+	})
+	w.logger.Info("container started", "taskID", t.ID, "containerID", result.ContainerId, "image", t.Image)
 
 	return result
 }
@@ -141,25 +174,22 @@ func (w *Worker) StopTask(t task.Task) task.DockerResult {
 		return result
 	}
 
-	t.FinishTime = time.Now().UTC()
-	t.State = task.Completed
-	w.Db[t.ID] = t
+	finishTime := time.Now().UTC()
+	w.upsertTask(t, func(p *task.Task) {
+		p.FinishTime = finishTime
+		p.State = task.Completed
+	})
 	w.logger.Info("container stopped and removed", "taskID", t.ID, "containerID", t.ContainerID)
 
 	return result
 }
 
 func (w *Worker) AddTask(t task.Task) {
-	w.Queue.Enqueue(t)
+	w.enqueueTask(t)
 }
 
-func (w *Worker) GetTasks() []task.Task {
-	tasks := make([]task.Task, 0, len(w.Db))
-	for _, value := range w.Db {
-		tasks = append(tasks, value)
-	}
-
-	return tasks
+func (w *Worker) GetTasks() ([]task.Task, error) {
+	return w.listTasks()
 }
 
 func (w *Worker) RunTasks(done <-chan struct{}) {
@@ -169,7 +199,7 @@ func (w *Worker) RunTasks(done <-chan struct{}) {
 			return
 		case <-time.After(10 * time.Second):
 		}
-		if w.Queue.Len() != 0 {
+		if w.queueLen() != 0 {
 			// Terminal consumer: nobody above us can act on this, so log once here.
 			result := w.RunTask()
 			if result.Error != nil {
@@ -203,7 +233,20 @@ func (w *Worker) UpdateTasks() {
 }
 
 func (w *Worker) updateTasks() {
-	for id, t := range w.Db {
+	// Snapshot first. Ranging the store while writing back into it was safe on
+	// a bare map only because the keys never changed; through the Store
+	// interface there is no such guarantee, and List already hands back a slice
+	// the loop owns.
+	tasks, err := w.listTasks()
+	if err != nil {
+		// Top of a loop goroutine: nobody above can act on this, so it is
+		// logged here and the pass is skipped. The next tick retries.
+		w.logger.Error("skipping task update pass: listing tasks failed", "err", err)
+		return
+	}
+
+	for _, t := range tasks {
+		id := t.ID
 		if t.State != task.Running {
 			continue
 		}
@@ -217,18 +260,29 @@ func (w *Worker) updateTasks() {
 		}
 		if resp.Container == nil {
 			w.logger.Warn("no container for running task", "taskID", id)
-			t.State = task.Failed
-			w.Db[id] = t
+			w.upsertTask(t, func(p *task.Task) {
+				p.State = task.Failed
+			})
 			continue
 		}
 
-		if resp.Container.Container.State.Status == "exited" {
+		exited := resp.Container.Container.State.Status == "exited"
+		if exited {
 			w.logger.Warn("container in non-running state",
 				"taskID", id, "state", resp.Container.Container.State.Status)
-			t.State = task.Failed
 		}
+		hostPorts := resp.Container.Container.NetworkSettings.Ports
 
-		t.HostPorts = resp.Container.Container.NetworkSettings.Ports
-		w.Db[id] = t
+		// The Inspect above is the I/O this merge exists for: the task may have
+		// been stopped while it ran, and this pass must not walk that back.
+		w.upsertTask(t, func(p *task.Task) {
+			if p.State != task.Running {
+				return
+			}
+			p.HostPorts = hostPorts
+			if exited {
+				p.State = task.Failed
+			}
+		})
 	}
 }

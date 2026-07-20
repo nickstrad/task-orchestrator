@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/nickstrad/task-orchestrator/internal/httpapi"
 	"github.com/nickstrad/task-orchestrator/internal/scheduler"
+	"github.com/nickstrad/task-orchestrator/internal/store"
 	"github.com/nickstrad/task-orchestrator/internal/task"
 )
 
@@ -32,6 +33,7 @@ func newTestManager(t *testing.T, addr string) *Manager {
 		[]WorkerMetadata{{Name: testWorker, Address: addr}},
 		scheduler.RoundRobin,
 		slog.New(slog.DiscardHandler),
+		store.InMemoryDb,
 	)
 }
 
@@ -53,11 +55,11 @@ func TestUpdateTasksFromWorkerPreservesRestartCount(t *testing.T) {
 	defer srv.Close()
 
 	m := newTestManager(t, srv.URL)
-	m.TaskDb[id] = task.Task{ID: id, State: task.Scheduled, RestartCount: 2}
+	seedTask(t, m, task.Task{ID: id, State: task.Scheduled, RestartCount: 2})
 
 	m.updateTasksFromWorker(testWorker)
 
-	got := m.TaskDb[id]
+	got := getTask(t, m, id)
 	if got.State != task.Running {
 		t.Errorf("State = %v, want %v", got.State, task.Running)
 	}
@@ -93,11 +95,11 @@ func TestUpdateTasksFromWorkerIgnoresNon200(t *testing.T) {
 	defer srv.Close()
 
 	m := newTestManager(t, srv.URL)
-	m.TaskDb[id] = task.Task{ID: id, State: task.Running}
+	seedTask(t, m, task.Task{ID: id, State: task.Running})
 
 	m.updateTasksFromWorker(testWorker)
 
-	if got := m.TaskDb[id].State; got != task.Running {
+	if got := getTask(t, m, id).State; got != task.Running {
 		t.Errorf("State = %v, want it left at %v", got, task.Running)
 	}
 }
@@ -115,14 +117,14 @@ func TestUpdateTasksFromWorkerSkipsUnknownTasks(t *testing.T) {
 	defer srv.Close()
 
 	m := newTestManager(t, srv.URL)
-	m.TaskDb[known] = task.Task{ID: known, State: task.Scheduled}
+	seedTask(t, m, task.Task{ID: known, State: task.Scheduled})
 
 	m.updateTasksFromWorker(testWorker)
 
-	if got := m.TaskDb[known].State; got != task.Running {
+	if got := getTask(t, m, known).State; got != task.Running {
 		t.Errorf("known task State = %v, want %v", got, task.Running)
 	}
-	if _, ok := m.TaskDb[unknown]; ok {
+	if _, ok := m.LookupTask(unknown); ok {
 		t.Error("unknown task was added to TaskDb")
 	}
 }
@@ -166,9 +168,9 @@ func TestUpdateTasksPollsWorkersConcurrently(t *testing.T) {
 		})
 	}
 
-	m := NewManager(workers, scheduler.RoundRobin, slog.New(slog.DiscardHandler))
+	m := NewManager(workers, scheduler.RoundRobin, slog.New(slog.DiscardHandler), store.InMemoryDb)
 	for _, id := range taskIDs {
-		m.TaskDb[id] = task.Task{ID: id, State: task.Scheduled}
+		seedTask(t, m, task.Task{ID: id, State: task.Scheduled})
 	}
 
 	finished := make(chan struct{})
@@ -196,7 +198,7 @@ func TestUpdateTasksPollsWorkersConcurrently(t *testing.T) {
 	}
 
 	for i, id := range taskIDs {
-		if got := m.TaskDb[id].State; got != task.Running {
+		if got := getTask(t, m, id).State; got != task.Running {
 			t.Errorf("task reported by w%d has State = %v, want %v", i, got, task.Running)
 		}
 	}
@@ -230,7 +232,7 @@ func TestSendWorkPostsTheEventAndRecordsTheAssignment(t *testing.T) {
 	if got := m.WorkerTaskMap[testWorker]; len(got) != 1 || got[0] != id {
 		t.Errorf("WorkerTaskMap[%q] = %v, want [%v]", testWorker, got, id)
 	}
-	if _, ok := m.TaskDb[id]; !ok {
+	if _, ok := m.LookupTask(id); !ok {
 		t.Error("task was not persisted to TaskDb")
 	}
 }
@@ -329,7 +331,7 @@ func TestStopTaskSendsDeleteAndRetiresTheTask(t *testing.T) {
 	defer srv.Close()
 
 	m := newTestManager(t, srv.URL)
-	m.TaskDb[id] = task.Task{ID: id, State: task.Running}
+	seedTask(t, m, task.Task{ID: id, State: task.Running})
 	m.TaskWorkerMap[id] = testWorker
 	m.WorkerTaskMap[testWorker] = []uuid.UUID{id}
 
@@ -338,7 +340,7 @@ func TestStopTaskSendsDeleteAndRetiresTheTask(t *testing.T) {
 	if want := "/tasks/" + id.String(); gotMethod != http.MethodDelete || gotPath != want {
 		t.Errorf("worker received %s %s, want DELETE %s", gotMethod, gotPath, want)
 	}
-	if got := m.TaskDb[id].State; got != task.Completed {
+	if got := getTask(t, m, id).State; got != task.Completed {
 		t.Errorf("State = %v, want %v", got, task.Completed)
 	}
 	if _, ok := m.TaskWorkerMap[id]; ok {
@@ -359,13 +361,13 @@ func TestStopTaskDoesNotRetireOnRejection(t *testing.T) {
 	defer srv.Close()
 
 	m := newTestManager(t, srv.URL)
-	m.TaskDb[id] = task.Task{ID: id, State: task.Running}
+	seedTask(t, m, task.Task{ID: id, State: task.Running})
 	m.TaskWorkerMap[id] = testWorker
 	m.WorkerTaskMap[testWorker] = []uuid.UUID{id}
 
 	m.stopTask(testWorker, id)
 
-	if got := m.TaskDb[id].State; got != task.Running {
+	if got := getTask(t, m, id).State; got != task.Running {
 		t.Errorf("State = %v, want it left at %v", got, task.Running)
 	}
 	if got := m.TaskWorkerMap[id]; got != testWorker {
@@ -384,13 +386,13 @@ func TestRetiredTaskIsNotHealthChecked(t *testing.T) {
 	defer srv.Close()
 
 	m := newTestManager(t, srv.URL)
-	m.TaskDb[id] = task.Task{ID: id, State: task.Running}
+	seedTask(t, m, task.Task{ID: id, State: task.Running})
 	m.TaskWorkerMap[id] = testWorker
 	m.WorkerTaskMap[testWorker] = []uuid.UUID{id}
 
 	m.stopTask(testWorker, id)
 
-	if got := decideHealthAction(m.TaskDb[id]); got != healthSkipNotEligible {
+	if got := decideHealthAction(getTask(t, m, id)); got != healthSkipNotEligible {
 		t.Errorf("decideHealthAction after stop = %v, want healthSkipNotEligible", got)
 	}
 }
@@ -413,17 +415,17 @@ func TestStaleRunningReportCannotResurrectARetiredTask(t *testing.T) {
 	defer srv.Close()
 
 	m := newTestManager(t, srv.URL)
-	m.TaskDb[id] = task.Task{ID: id, State: task.Running}
+	seedTask(t, m, task.Task{ID: id, State: task.Running})
 	m.TaskWorkerMap[id] = testWorker
 	m.WorkerTaskMap[testWorker] = []uuid.UUID{id}
 
 	m.stopTask(testWorker, id)
 	m.updateTasksFromWorker(testWorker)
 
-	if got := m.TaskDb[id].State; got != task.Completed {
+	if got := getTask(t, m, id).State; got != task.Completed {
 		t.Errorf("State = %v, want %v — a stale report walked the task back", got, task.Completed)
 	}
-	if got := decideHealthAction(m.TaskDb[id]); got != healthSkipNotEligible {
+	if got := decideHealthAction(getTask(t, m, id)); got != healthSkipNotEligible {
 		t.Errorf("decideHealthAction = %v, want healthSkipNotEligible", got)
 	}
 }
@@ -521,7 +523,7 @@ func TestDoHealthChecksRunsBeforeItsFirstSleep(t *testing.T) {
 	m := newTestManager(t, srv.URL)
 	// An interval long enough that a second tick cannot be what restarts it.
 	m.healthCheckInterval = time.Hour
-	m.TaskDb[id] = task.Task{ID: id, State: task.Failed}
+	seedTask(t, m, task.Task{ID: id, State: task.Failed})
 	m.TaskWorkerMap[id] = testWorker
 
 	done := make(chan struct{})
@@ -538,7 +540,7 @@ func TestDoHealthChecksRunsBeforeItsFirstSleep(t *testing.T) {
 		}
 	}
 
-	if got := m.TaskDb[id].RestartCount; got != 1 {
+	if got := getTask(t, m, id).RestartCount; got != 1 {
 		t.Errorf("RestartCount = %d, want 1", got)
 	}
 }
@@ -555,7 +557,7 @@ func TestDoHealthChecksStopsWhenDoneIsAlreadyClosed(t *testing.T) {
 
 	m := newTestManager(t, srv.URL)
 	m.healthCheckInterval = time.Millisecond
-	m.TaskDb[uuid.New()] = task.Task{ID: uuid.New(), State: task.Failed}
+	seedTask(t, m, task.Task{ID: uuid.New(), State: task.Failed})
 
 	done := make(chan struct{})
 	close(done)
@@ -615,7 +617,7 @@ func TestConcurrentLoopsAreRaceFree(t *testing.T) {
 	// Seed both a backlog to schedule and tasks already assigned, so every loop
 	// has real work and they contend on the same maps.
 	for _, id := range ids {
-		m.TaskDb[id] = task.Task{ID: id, State: task.Running}
+		seedTask(t, m, task.Task{ID: id, State: task.Running})
 		m.TaskWorkerMap[id] = testWorker
 		m.WorkerTaskMap[testWorker] = append(m.WorkerTaskMap[testWorker], id)
 		m.AddTask(task.TaskEvent{ID: uuid.New(), Task: task.Task{ID: uuid.New(), State: task.Scheduled}})
@@ -708,4 +710,24 @@ func TestConcurrentSendWorkDispatchesEachTaskOnce(t *testing.T) {
 			t.Errorf("task %v was dispatched %d times, want exactly 1", id, count)
 		}
 	}
+}
+
+// seedTask and getTask are the test-side equivalents of the map writes and
+// reads these tests used before TaskDb became a store.Store. They keep the
+// interface{} round-trip and its error handling in one place instead of at
+// every assertion.
+func seedTask(t *testing.T, m *Manager, tk task.Task) {
+	t.Helper()
+	if err := m.putTask(tk); err != nil {
+		t.Fatalf("seeding task %s: %v", tk.ID, err)
+	}
+}
+
+func getTask(t *testing.T, m *Manager, id uuid.UUID) task.Task {
+	t.Helper()
+	tk, ok := m.LookupTask(id)
+	if !ok {
+		t.Fatalf("task %s not found in task db", id)
+	}
+	return tk
 }

@@ -57,10 +57,16 @@ func (a *API) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
 		httpapi.WriteError(w, http.StatusBadRequest, "no taskID passed in request")
 		return
 	}
-	parsedTaskID, _ := uuid.Parse(taskID)
+	parsedTaskID, err := uuid.Parse(taskID)
+	if err != nil {
+		a.logger.Warn("unparseable taskID in request", "taskID", taskID,
+			"err", E("manager.API.StopTaskHandler", "parsing taskID", err))
+		httpapi.WriteError(w, http.StatusBadRequest, "taskID is not a valid uuid")
+		return
+	}
 
-	t, exists := a.Manager.TaskDb[parsedTaskID]
-	if !exists {
+	t, ok := a.Manager.LookupTask(parsedTaskID)
+	if !ok {
 		a.logger.Warn("task does not exist on manager", "taskID", taskID)
 		httpapi.WriteError(w, http.StatusNotFound, "task does not exist on manager")
 		return
@@ -80,7 +86,15 @@ func (a *API) StopTaskHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) GetTasksHandler(w http.ResponseWriter, r *http.Request) {
-	httpapi.WriteJSON(w, http.StatusOK, a.Manager.GetTasks())
+	tasks, err := a.Manager.GetTasks()
+	if err != nil {
+		// The error crossed no process boundary, but it stops here: the client
+		// gets a status, not our error chain.
+		a.logger.Error("listing tasks failed", "err", err)
+		httpapi.WriteError(w, http.StatusInternalServerError, "could not list tasks")
+		return
+	}
+	httpapi.WriteJSON(w, http.StatusOK, tasks)
 }
 
 func (a *API) initRouter() {

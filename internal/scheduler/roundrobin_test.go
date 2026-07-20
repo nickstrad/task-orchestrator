@@ -11,8 +11,8 @@ import (
 // does, and returns the name of the node the scheduler landed on.
 func schedule(s Scheduler, t task.Task, nodes []node.Node) string {
 	candidates := s.SelectCandidateNodes(t, nodes)
-	scores, _ := s.Score(t, candidates)
-	return s.Pick(scores, candidates).Name
+	scored, _ := s.Score(t, candidates)
+	return s.Pick(scored).Name
 }
 
 func TestRoundRobinSchedulerSelectCandidateNodesReturnsEveryNode(t *testing.T) {
@@ -90,20 +90,20 @@ func TestRoundRobinSchedulerScoreGivesExactlyOneWinner(t *testing.T) {
 	r := &RoundRobinScheduler{}
 	nodes := nodesNamed("a", "b", "c")
 
-	scores, _ := r.Score(task.Task{}, nodes)
+	scored, _ := r.Score(task.Task{}, nodes)
 
 	winners := 0
-	for name, score := range scores {
-		switch score {
+	for _, s := range scored {
+		switch s.Score {
 		case 1:
 			winners++
 		case 0:
 		default:
-			t.Errorf("score for %q = %v, want 0 or 1", name, score)
+			t.Errorf("score for %q = %v, want 0 or 1", s.Node.Name, s.Score)
 		}
 	}
 	if winners != 1 {
-		t.Errorf("got %d nodes scored 1, want exactly 1 (scores %v)", winners, scores)
+		t.Errorf("got %d nodes scored 1, want exactly 1 (scored %v)", winners, scored)
 	}
 }
 
@@ -113,16 +113,16 @@ func TestRoundRobinSchedulerScoreGivesExactlyOneWinner(t *testing.T) {
 func TestRoundRobinSchedulerHandlesNoNodes(t *testing.T) {
 	r := &RoundRobinScheduler{}
 
-	scores, _ := r.Score(task.Task{}, nil)
-	if len(scores) != 0 {
-		t.Errorf("Score with no nodes = %v, want an empty map", scores)
+	scored, _ := r.Score(task.Task{}, nil)
+	if len(scored) != 0 {
+		t.Errorf("Score with no nodes = %v, want nothing scored", scored)
 	}
 	if r.LastWorker != 0 {
 		t.Errorf("Score with no nodes moved the cursor to %d, want it left at 0", r.LastWorker)
 	}
 
-	if got := r.Pick(scores, nil); got.Name != "" {
-		t.Errorf("Pick with no candidates = %q, want the zero Node", got.Name)
+	if got := r.Pick(scored); got.Name != "" {
+		t.Errorf("Pick with nothing scored = %q, want the zero Node", got.Name)
 	}
 }
 
