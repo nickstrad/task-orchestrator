@@ -155,16 +155,12 @@ func (m *Manager) ProcessTasks(done <-chan struct{}) {
 }
 
 func (m *Manager) updateTasks() {
-	// Set once by NewManager and never written again, so no lock is needed.
 	var wg sync.WaitGroup
-	wg.Add(len(m.WorkerNodes))
+	// Set once by NewManager and never written again, so no lock is needed.
 	for _, n := range m.WorkerNodes {
-		// One worker per call, so the response body is closed as soon as we are
-		// done with it rather than piling up until every worker has been polled.
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			m.updateTasksFromWorker(n.Name)
-		}()
+		})
 	}
 	wg.Wait()
 }

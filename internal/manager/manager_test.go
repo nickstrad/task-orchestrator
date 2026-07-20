@@ -2,6 +2,7 @@ package manager
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -123,6 +124,81 @@ func TestUpdateTasksFromWorkerSkipsUnknownTasks(t *testing.T) {
 	}
 	if _, ok := m.TaskDb[unknown]; ok {
 		t.Error("unknown task was added to TaskDb")
+	}
+}
+
+// TestUpdateTasksPollsWorkersConcurrently pins the fan-out in updateTasks.
+//
+// Every handler blocks until all of them have been entered, so the test can
+// only get past the barrier if the workers are being polled at the same time.
+// A sequential loop parks on the first worker and never reaches the second,
+// which trips the deadline below rather than passing slowly.
+//
+// The other half of its job is what it drags in under -race: several
+// applyWorkerReport calls writing into TaskDb at once. That is the pairing the
+// fan-out created, and the assertion that fails if a write is ever moved out
+// from under m.mu.
+func TestUpdateTasksPollsWorkersConcurrently(t *testing.T) {
+	const numWorkers = 3
+
+	// Buffered so a handler can report arrival and still be released on the
+	// failure path below without deadlocking.
+	arrived := make(chan struct{}, numWorkers)
+	release := make(chan struct{})
+
+	workers := make([]WorkerMetadata, 0, numWorkers)
+	taskIDs := make([]uuid.UUID, 0, numWorkers)
+	for i := range numWorkers {
+		id := uuid.New()
+		taskIDs = append(taskIDs, id)
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			arrived <- struct{}{}
+			<-release
+			httpapi.WriteJSON(w, http.StatusOK,
+				[]task.Task{{ID: id, State: task.Running, ContainerID: "abc"}})
+		}))
+		defer srv.Close()
+
+		workers = append(workers, WorkerMetadata{
+			Name:    fmt.Sprintf("w%d", i),
+			Address: srv.URL,
+		})
+	}
+
+	m := NewManager(workers, scheduler.RoundRobin, slog.New(slog.DiscardHandler))
+	for _, id := range taskIDs {
+		m.TaskDb[id] = task.Task{ID: id, State: task.Scheduled}
+	}
+
+	finished := make(chan struct{})
+	go func() {
+		m.updateTasks()
+		close(finished)
+	}()
+
+	// Every worker must be mid-request before any of them is allowed to answer.
+	for i := range numWorkers {
+		select {
+		case <-arrived:
+		case <-time.After(2 * time.Second):
+			close(release) // unblock whoever is waiting, so Close does not hang
+			t.Fatalf("only %d of %d workers were polled before the deadline — "+
+				"updateTasks is not fanning out", i, numWorkers)
+		}
+	}
+	close(release)
+
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("updateTasks did not return after every worker answered")
+	}
+
+	for i, id := range taskIDs {
+		if got := m.TaskDb[id].State; got != task.Running {
+			t.Errorf("task reported by w%d has State = %v, want %v", i, got, task.Running)
+		}
 	}
 }
 
