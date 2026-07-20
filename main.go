@@ -226,6 +226,6 @@ func doWork(done <-chan struct{}, workerNum int, logger *slog.Logger) (<-chan Up
 		wLogger.Info("cleaning up, closing value stream")
 	}()
 
-	return valueStream, manager.WorkerMetadata{Name: workerName, ID: workerNum, Address: workerAddr}
+	return valueStream, manager.WorkerMetadata{Name: workerName, Address: workerAddr}
 
 }

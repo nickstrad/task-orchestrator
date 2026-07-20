@@ -30,19 +30,10 @@ import (
 //  3. Reads return copies. Handing a caller the live slice out of
 //     WorkerTaskMap would let it read that memory after the lock is gone.
 //
-// The fields set once by NewManager and never written again — Workers,
-// WorkerNameToAddress, WorkerNameToID, WorkerNodes, logger, and the intervals —
-// are not guarded, because a value that is only ever read needs no lock. Keep
-// it that way: making any of them mutable means bringing it under m.mu.
-
-// taskByID returns the manager's copy of a task.
-func (m *Manager) taskByID(id uuid.UUID) (task.Task, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	t, ok := m.TaskDb[id]
-	return t, ok
-}
+// The fields set once by NewManager and never written again — WorkerNodes,
+// httpClient, logger, and the intervals — are not guarded, because a value that
+// is only ever read needs no lock. Keep it that way: making any of them mutable
+// means bringing it under m.mu.
 
 // putTask stores a task, overwriting any existing copy.
 func (m *Manager) putTask(t task.Task) {

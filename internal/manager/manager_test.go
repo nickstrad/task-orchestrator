@@ -17,8 +17,8 @@ import (
 )
 
 // These tests stand a fake worker up on an httptest.Server and point the
-// manager at it through WorkerNameToAddress, which is the seam NewManager
-// already exposes. Nothing is mocked: the manager builds real URLs, speaks real
+// manager at it through the WorkerMetadata address NewManager already takes.
+// Nothing is mocked: the manager builds real URLs, speaks real
 // JSON, and reads real status codes, so a wrong path or a wrong verb fails here
 // rather than in a live run.
 
@@ -28,7 +28,7 @@ const testWorker = "w1"
 func newTestManager(t *testing.T, addr string) *Manager {
 	t.Helper()
 	return NewManager(
-		[]WorkerMetadata{{Name: testWorker, ID: 1, Address: addr}},
+		[]WorkerMetadata{{Name: testWorker, Address: addr}},
 		scheduler.RoundRobin,
 		slog.New(slog.DiscardHandler),
 	)
@@ -204,8 +204,11 @@ func TestSendWorkRetriesAfterTheWorkerComesBack(t *testing.T) {
 		t.Fatalf("setup: Pending.Len() = %d, want 1", got)
 	}
 
-	// Round two: same manager, worker now answering.
-	m.WorkerNameToAddress[testWorker] = srv.URL
+	// Round two: same manager, worker now answering. WorkerNodes is normally
+	// write-once, so this reaches into it directly rather than through a
+	// setter the production code has no use for. Safe only because the write
+	// sits between two synchronous SendWork calls on this goroutine.
+	m.WorkerNodes[0].API = srv.URL
 	m.SendWork()
 
 	if got := posts.Load(); got != 1 {

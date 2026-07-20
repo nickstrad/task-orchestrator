@@ -3,6 +3,7 @@ package manager
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -26,22 +27,31 @@ const (
 	DefaultUpdateInterval      = 15 * time.Second
 	DefaultProcessInterval     = 10 * time.Second
 	DefaultHealthCheckInterval = 60 * time.Second
+
+	// WorkerRequestTimeout caps every request the manager makes to a worker.
+	//
+	// Without it these calls use http.DefaultClient, whose Timeout is zero: a
+	// worker that accepts the connection and then never answers blocks the
+	// calling loop forever, not just for that worker. The update loop polls
+	// workers one at a time, so a single wedged worker stops task updates for
+	// all of them, permanently.
+	WorkerRequestTimeout = 30 * time.Second
 )
 
 type Manager struct {
-	mu                  sync.RWMutex
-	LastWorker          int
-	Pending             *queue.Queue[task.TaskEvent]
-	TaskDb              map[uuid.UUID]task.Task
-	EventDb             map[uuid.UUID]task.TaskEvent
-	Workers             []string
-	WorkerTaskMap       map[string][]uuid.UUID
-	WorkerNameToAddress map[string]string
-	TaskWorkerMap       map[uuid.UUID]string
-	WorkerNameToID      map[string]int
-	WorkerNodes         []node.Node
-	Scheduler           scheduler.Scheduler
-	logger              *slog.Logger
+	mu            sync.RWMutex
+	Pending       *queue.Queue[task.TaskEvent]
+	TaskDb        map[uuid.UUID]task.Task
+	EventDb       map[uuid.UUID]task.TaskEvent
+	WorkerTaskMap map[string][]uuid.UUID
+	TaskWorkerMap map[uuid.UUID]string
+	WorkerNodes   []node.Node
+	Scheduler     scheduler.Scheduler
+	logger        *slog.Logger
+
+	// httpClient is every outbound call to a worker. It exists to carry
+	// WorkerRequestTimeout; http.DefaultClient has none.
+	httpClient *http.Client
 
 	// How often each background loop wakes. Defaulted by NewManager; a test
 	// overrides them to keep the loops sub-second.
@@ -52,44 +62,61 @@ type Manager struct {
 
 type WorkerMetadata struct {
 	Name    string
-	ID      int
 	Address string
 }
 
 func NewManager(workers []WorkerMetadata, schedulerType string, logger *slog.Logger) *Manager {
 	workerTaskMap := make(map[string][]uuid.UUID)
-	workerNameToID := make(map[string]int)
-	workerNameToAddress := make(map[string]string)
-	workerNames := []string{}
 
-	var nodes []node.Node
+	nodes := make([]node.Node, 0, len(workers))
 	for _, w := range workers {
 		workerTaskMap[w.Name] = []uuid.UUID{}
-		workerNameToID[w.Name] = w.ID
-		workerNames = append(workerNames, w.Name)
-		workerNameToAddress[w.Name] = w.Address
 		nodes = append(nodes, node.NewNode(w.Name, w.Address, "worker", logger))
 	}
 
 	s := scheduler.GetScheduler(schedulerType, logger)
 
 	return &Manager{
-		LastWorker:          0,
 		Pending:             queue.New[task.TaskEvent](),
 		TaskDb:              make(map[uuid.UUID]task.Task),
 		EventDb:             make(map[uuid.UUID]task.TaskEvent),
-		Workers:             workerNames,
-		WorkerNameToID:      workerNameToID,
 		WorkerTaskMap:       workerTaskMap,
-		WorkerNameToAddress: workerNameToAddress,
 		TaskWorkerMap:       make(map[uuid.UUID]string),
 		Scheduler:           s,
 		WorkerNodes:         nodes,
+		httpClient:          &http.Client{Timeout: WorkerRequestTimeout},
 		logger:              logger,
 		updateInterval:      DefaultUpdateInterval,
 		processInterval:     DefaultProcessInterval,
 		healthCheckInterval: DefaultHealthCheckInterval,
 	}
+}
+
+// workerAddress returns the API address of a worker by name. WorkerNodes is set
+// once by NewManager and never written again, so this needs no lock.
+//
+// The scan is linear rather than a name-keyed index: the worker set is small and
+// fixed, every caller is about to make an HTTP request anyway, and an index
+// would be a second copy of WorkerNodes to keep in step.
+func (m *Manager) workerAddress(name string) (string, bool) {
+	for i := range m.WorkerNodes {
+		if m.WorkerNodes[i].Name == name {
+			return m.WorkerNodes[i].API, true
+		}
+	}
+	return "", false
+}
+
+// requireWorkerAddress is workerAddress for callers that cannot continue
+// without one. The error is minted here rather than at each call site because
+// this is the layer that knows what failed to resolve; the caller supplies its
+// own op and decides whether to log or return.
+func (m *Manager) requireWorkerAddress(op, name string) (string, error) {
+	addr, ok := m.workerAddress(name)
+	if !ok {
+		return "", E(op, fmt.Sprintf("no worker address found for worker %s", name), nil)
+	}
+	return addr, nil
 }
 
 func (m *Manager) SelectWorker(t task.Task) (node.Node, error) {
@@ -128,32 +155,41 @@ func (m *Manager) ProcessTasks(done <-chan struct{}) {
 }
 
 func (m *Manager) updateTasks() {
-	for _, workerName := range m.Workers {
+	// Set once by NewManager and never written again, so no lock is needed.
+	var wg sync.WaitGroup
+	wg.Add(len(m.WorkerNodes))
+	for _, n := range m.WorkerNodes {
 		// One worker per call, so the response body is closed as soon as we are
 		// done with it rather than piling up until every worker has been polled.
-		m.updateTasksFromWorker(workerName)
+		go func() {
+			defer wg.Done()
+			m.updateTasksFromWorker(n.Name)
+		}()
 	}
+	wg.Wait()
 }
 
 func (m *Manager) updateTasksFromWorker(workerName string) {
-	// Set once by NewManager and never written again, so no lock is needed.
-	workerID := m.WorkerNameToID[workerName]
-	workerURL := m.WorkerNameToAddress[workerName]
+	workerURL, exists := m.workerAddress(workerName)
+	if !exists {
+		m.logger.Warn("skipping task update for unknown worker", "worker", workerName)
+		return
+	}
 
-	m.logger.Debug("checking worker for task updates", "workerID", workerID, "url", workerURL)
+	m.logger.Debug("checking worker for task updates", "worker", workerName, "url", workerURL)
 	url := WorkerTasksURL(workerURL)
-	resp, err := http.Get(url)
+	resp, err := m.httpClient.Get(url)
 	if err != nil {
 		m.logger.Warn("connecting to worker failed",
 			"err", E("manager.updateTasksFromWorker", "connecting to worker "+workerName, err),
-			"workerID", workerID)
+			"worker", workerName)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		m.logger.Warn("worker returned unexpected status",
-			"workerID", workerID, "code", resp.StatusCode)
+			"worker", workerName, "code", resp.StatusCode)
 		return
 	}
 
@@ -162,16 +198,62 @@ func (m *Manager) updateTasksFromWorker(workerName string) {
 	if err := decoder.Decode(&tasks); err != nil {
 		m.logger.Warn("unmarshalling tasks failed",
 			"err", E("manager.updateTasksFromWorker", "decoding task list", err),
-			"workerID", workerID)
+			"worker", workerName)
 		return
 	}
 
 	for _, t := range tasks {
 		// One unknown task must not abort updates for the remaining tasks.
 		if !m.applyWorkerReport(t) {
-			m.logger.Warn("task not found in task db", "taskID", t.ID, "workerID", workerID)
+			m.logger.Warn("task not found in task db", "taskID", t.ID, "worker", workerName)
 		}
 	}
+}
+
+// errWorkerUnreachable marks a send that never reached the worker. It is the
+// one failure the callers treat differently: the request did not land, so the
+// event is safe to put back on the queue. Every other failure means the worker
+// answered and said no, and requeueing would just repeat it.
+var errWorkerUnreachable = errors.New("worker unreachable")
+
+// postTaskEvent sends te to a worker and returns the task the worker created.
+//
+// SendWork and restartTask both do this, and both got it slightly differently
+// wrong to read; the op string is a parameter so each keeps its own identity in
+// the error chain.
+func (m *Manager) postTaskEvent(op, workerName, workerAddr string, te task.TaskEvent) (task.Task, error) {
+	data, err := json.Marshal(te)
+	if err != nil {
+		return task.Task{}, E(op, "marshalling task event", err)
+	}
+
+	url := WorkerTasksURL(workerAddr)
+	resp, err := m.httpClient.Post(url, "application/json", bytes.NewBuffer(data))
+	if err != nil {
+		return task.Task{}, E(op, "connecting to worker "+workerName,
+			errors.Join(errWorkerUnreachable, err))
+	}
+	defer resp.Body.Close()
+
+	decoder := json.NewDecoder(resp.Body)
+
+	if resp.StatusCode != http.StatusCreated {
+		// The worker's Go error never crosses the wire — all we get is a DTO.
+		// Read what it said, then mint a fresh error of our own rather than
+		// pretending to wrap one we do not have.
+		e := httpapi.ErrorResponse{}
+		if err := decoder.Decode(&e); err != nil {
+			return task.Task{}, E(op, "decoding error response", err)
+		}
+		return task.Task{}, E(op,
+			fmt.Sprintf("worker %s rejected task (%d): %s", workerName, e.Code, e.Message), nil)
+	}
+
+	created := task.Task{}
+	if err := decoder.Decode(&created); err != nil {
+		return task.Task{}, E(op, "decoding created task", err)
+	}
+	return created, nil
 }
 
 func (m *Manager) SendWork() {
@@ -196,60 +278,29 @@ func (m *Manager) SendWork() {
 		return
 	}
 
-	node, err := m.SelectWorker(taskEvent.Task)
+	selected, err := m.SelectWorker(taskEvent.Task)
 	if err != nil {
 		m.logger.Error("selecting worker failed", "err", err, "taskID", t.ID)
 		return
 	}
 
-	workerName := node.Name
-	data, err := json.Marshal(taskEvent)
-	if err != nil {
-		m.logger.Error("marshalling task event failed",
-			"err", E("manager.SendWork", "marshalling task event", err), "taskID", t.ID)
-		return
-	}
-
+	workerName := selected.Name
 	m.assignTask(workerName, taskEvent)
 
-	url := WorkerTasksURL(m.WorkerNameToAddress[workerName])
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
-
+	// The scheduler already handed us the node, so the address comes straight
+	// off it rather than through another lookup by name.
+	newTask, err := m.postTaskEvent("manager.SendWork", workerName, selected.API, taskEvent)
 	if err != nil {
-		// The assignment was committed before the send, so it has to be rolled
-		// back: a requeued task that is still routed to a worker looks like a
-		// duplicate on the next pass and gets dropped.
-		m.unassignTask(workerName, t.ID)
-		m.logger.Warn("worker unreachable, requeueing task",
-			"err", E("manager.SendWork", "connecting to worker "+workerName, err), "taskID", t.ID)
-		m.enqueueEvent(taskEvent)
-		return
-	}
-	defer resp.Body.Close()
-
-	decoder := json.NewDecoder(resp.Body)
-
-	if resp.StatusCode != http.StatusCreated {
-		// The worker's Go error never crosses the wire — all we get is a DTO.
-		// Log what it said, then mint a fresh error of our own rather than
-		// pretending to wrap one we do not have.
-		e := httpapi.ErrorResponse{}
-		if err := decoder.Decode(&e); err != nil {
-			m.logger.Error("decoding worker error response failed",
-				"err", E("manager.SendWork", "decoding error response", err), "taskID", t.ID)
+		if errors.Is(err, errWorkerUnreachable) {
+			// The assignment was committed before the send, so it has to be
+			// rolled back: a requeued task that is still routed to a worker
+			// looks like a duplicate on the next pass and gets dropped.
+			m.unassignTask(workerName, t.ID)
+			m.logger.Warn("worker unreachable, requeueing task", "err", err, "taskID", t.ID)
+			m.enqueueEvent(taskEvent)
 			return
 		}
-		rejected := E("manager.SendWork",
-			fmt.Sprintf("worker %s rejected task (%d): %s", workerName, e.Code, e.Message), nil)
-		m.logger.Error("worker rejected task", "err", rejected, "taskID", t.ID, "code", e.Code)
-		return
-	}
-
-	newTask := task.Task{}
-
-	if err := decoder.Decode(&newTask); err != nil {
-		m.logger.Error("decoding worker response failed",
-			"err", E("manager.SendWork", "decoding created task", err), "taskID", t.ID)
+		m.logger.Error("sending task to worker failed", "err", err, "taskID", t.ID)
 		return
 	}
 
@@ -276,10 +327,9 @@ func (m *Manager) checkTaskHealth(t task.Task) error {
 		return E("manager.checkTaskHealth", fmt.Sprintf("no host port found for task %s", t.ID), nil)
 	}
 
-	workerAddr, exists := m.WorkerNameToAddress[workerName]
-
-	if !exists {
-		return E("manager.checkTaskHealth", fmt.Sprintf("no worker address found for worker %s for %s", workerName, t.ID), nil)
+	workerAddr, err := m.requireWorkerAddress("manager.checkTaskHealth", workerName)
+	if err != nil {
+		return err
 	}
 
 	url, err := healthCheckURL(workerAddr, hostPort, t.HealthCheck)
@@ -287,7 +337,7 @@ func (m *Manager) checkTaskHealth(t task.Task) error {
 		return E("manager.checkTaskHealth", fmt.Sprintf("building health check url for task %s", t.ID), err)
 	}
 	m.logger.Debug("calling health check", "taskID", t.ID, "url", url)
-	resp, err := http.Get(url)
+	resp, err := m.httpClient.Get(url)
 	if err != nil {
 		return E("manager.checkTaskHealth", "connecting to health check "+url, err)
 	}
@@ -338,7 +388,11 @@ func (m *Manager) restartTask(t task.Task) {
 			"taskID", t.ID)
 		return
 	}
-	wAddress := m.WorkerNameToAddress[w]
+	wAddress, err := m.requireWorkerAddress("manager.restartTask", w)
+	if err != nil {
+		m.logger.Error("restarting task failed", "err", err, "taskID", t.ID)
+		return
+	}
 
 	t, ok := m.beginRestart(t.ID)
 	if !ok {
@@ -354,53 +408,24 @@ func (m *Manager) restartTask(t task.Task) {
 		Timestamp: time.Now(),
 		Task:      t,
 	}
-	data, err := json.Marshal(&te)
+	newTask, err := m.postTaskEvent("manager.restartTask", w, wAddress, te)
 	if err != nil {
-		m.logger.Error("marshalling task event failed",
-			"err", E("manager.restartTask", "marshalling task event", err), "taskID", t.ID)
-		return
-	}
-	url := WorkerTasksURL(wAddress)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
-	if err != nil {
-		m.logger.Warn("worker unreachable, requeueing task",
-			"err", E("manager.restartTask", "connecting to worker "+w, err),
-			"taskID", t.ID, "addr", wAddress)
-		m.enqueueEvent(te)
-		return
-	}
-
-	defer resp.Body.Close()
-
-	d := json.NewDecoder(resp.Body)
-	if resp.StatusCode != http.StatusCreated {
-		e := httpapi.ErrorResponse{}
-		if err := d.Decode(&e); err != nil {
-			m.logger.Error("decoding worker error response failed",
-				"err", E("manager.restartTask", "decoding error response", err), "taskID", t.ID)
+		if errors.Is(err, errWorkerUnreachable) {
+			m.logger.Warn("worker unreachable, requeueing task",
+				"err", err, "taskID", t.ID, "addr", wAddress)
+			m.enqueueEvent(te)
 			return
 		}
-		rejected := E("manager.restartTask",
-			fmt.Sprintf("worker %s rejected restart (%d): %s", w, e.Code, e.Message), nil)
-		m.logger.Error("worker rejected restart", "err", rejected, "taskID", t.ID, "code", e.Code)
-		return
-	}
-
-	newTask := task.Task{}
-	if err := d.Decode(&newTask); err != nil {
-		m.logger.Error("decoding worker response failed",
-			"err", E("manager.restartTask", "decoding restarted task", err), "taskID", t.ID)
+		m.logger.Error("restarting task on worker failed", "err", err, "taskID", t.ID)
 		return
 	}
 	m.logger.Info("task restarted", "taskID", newTask.ID, "restartCount", t.RestartCount)
 }
 
 func (m *Manager) stopTask(worker string, taskID uuid.UUID) {
-	workerAddr, exists := m.WorkerNameToAddress[worker]
-	if !exists {
-		m.logger.Error("stopping task failed",
-			"err", E("manager.stopTask", fmt.Sprintf("no worker address found for worker %s", worker), nil),
-			"taskID", taskID)
+	workerAddr, err := m.requireWorkerAddress("manager.stopTask", worker)
+	if err != nil {
+		m.logger.Error("stopping task failed", "err", err, "taskID", taskID)
 		return
 	}
 
@@ -413,7 +438,7 @@ func (m *Manager) stopTask(worker string, taskID uuid.UUID) {
 		return
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := m.httpClient.Do(req)
 	if err != nil {
 		m.logger.Error("worker unreachable, task not stopped",
 			"err", E("manager.stopTask", "connecting to worker "+worker, err),

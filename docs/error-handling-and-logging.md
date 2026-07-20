@@ -88,8 +88,13 @@ Accept a logger, don't reach for a global. `slog.Default()` and package-level
 
 ### Attribute keys
 
-`component`, `subcomponent`, `addr`, `workerID` (int), `taskID` (uuid), `containerID`,
+`component`, `subcomponent`, `addr`, `worker` (name), `taskID` (uuid), `containerID`,
 `err`, `state`, `image`, `url`, `code` (HTTP status).
+
+`worker` is the routing key — it is what the manager's maps are keyed by and what
+identifies a worker across components. `main.go` and a worker's own child logger also
+carry `workerID` (int), but that is a process-local index from the spawn loop, not a
+shared identity; don't join on it.
 
 ### Levels
 
