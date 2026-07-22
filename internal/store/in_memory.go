@@ -20,6 +20,8 @@ func NewInMemory[T any]() *InMemory[T] {
 	return &InMemory[T]{Db: make(map[string]T)}
 }
 
+func (i *InMemory[T]) Close() error { return nil }
+
 func (i *InMemory[T]) Put(key string, value T) error {
 	i.Db[key] = value
 	return nil

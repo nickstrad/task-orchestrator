@@ -37,9 +37,13 @@ func main() {
 	done := make(chan struct{})
 
 	wg.Go(func() {
-		defer close(done)
-		sig := <-sigChan
-		mainLogger.Info("received signal, cleaning up", "signal", sig)
+		select {
+		case <-done:
+			mainLogger.Info("done channel close. goodbye.")
+		case sig := <-sigChan:
+			close(done)
+			mainLogger.Info("received signal, cleaning up", "signal", sig)
+		}
 	})
 
 	for i := range totalWorkers {
@@ -48,6 +52,7 @@ func main() {
 			defer wg.Done()
 			stream, workerMetadata := doWork(done, workerNum, logger)
 			workerStream <- workerMetadata
+
 			for v := range stream {
 				select {
 				case <-done:
@@ -71,21 +76,33 @@ func main() {
 				return
 			default:
 			}
+
 			workers = append(workers, <-workerStream)
 		}
+
 		mLogger := logger.With("component", "manager", "addr", mAddr)
-		m := manager.NewManager(workers, scheduler.MarginalCost, mLogger, store.InMemoryDb)
+		m, err := manager.NewManager(workers, scheduler.MarginalCost, mLogger, store.PersistentDb)
+		if err != nil {
+			mainLogger.Error("cant setup manager", "err", err)
+			close(done)
+			return
+		}
+
 		api := manager.NewAPI(mHost, mPort, m, mLogger)
 		go api.Start(done)
 		go api.Manager.UpdateTasks(done)
 		go api.Manager.DoHealthChecks(done)
 		go api.Manager.ProcessTasks(done)
 		mLogger.Info("listening")
-		defer api.Stop()
-		<-done
-	})
+		// Stop serving requests before closing the stores those requests read
+		// and write.
+		defer func() {
+			api.Stop()
+			if err := m.Close(); err != nil {
+				mLogger.Error("closing manager stores failed", "err", err)
+			}
+		}()
 
-	wg.Go(func() {
 		taskEvents := []task.TaskEvent{
 			newEchoServerTaskEvent("echo-healthy", "/health"),
 			newEchoServerTaskEvent("echo-healthfail", "/health"),
@@ -127,6 +144,7 @@ func main() {
 			mainLogger.Debug("sleeping", "seconds", 3)
 			time.Sleep(3 * time.Second)
 		}
+		<-done
 	})
 
 	wg.Wait()
@@ -171,6 +189,15 @@ func newEchoServerTaskEvent(name, healthCheck string) task.TaskEvent {
 // task.Docker.Stop does both, so this is all that's needed to leave the
 // docker daemon clean after a Ctrl-C.
 func stopWorkerTasks(w *worker.Worker, logger *slog.Logger) {
+	// Close the store once every container is dealt with — deferred so it runs
+	// even if listing tasks below fails. GetTasks/StopTask read the store, so
+	// this must come after them, not before.
+	defer func() {
+		if err := w.Close(); err != nil {
+			logger.Error("closing worker store failed", "err", err)
+		}
+	}()
+
 	tasks, err := w.GetTasks()
 	if err != nil {
 		// Shutdown path: log and move on. Failing to enumerate tasks leaves
@@ -213,7 +240,13 @@ func doWork(done <-chan struct{}, workerNum int, logger *slog.Logger) (<-chan Up
 	workerAddr := fmt.Sprintf("http://%s:%d", host, port)
 	wLogger := logger.With("component", workerName, "workerID", workerNum, "addr", workerAddr)
 	wLogger.Info("listening")
-	w := worker.NewWorker(workerName, workerNum, wLogger, store.InMemoryDb)
+	w, err := worker.NewWorker(workerName, workerNum, wLogger, store.InMemoryDb, true)
+	if err != nil {
+		logger.Error("unable to create new workder",
+			"err", err, "workerNum", workerNum, "workerName", workerName)
+		close(valueStream)
+		return nil, manager.WorkerMetadata{}
+	}
 	go w.CollectStats(done)
 	api := worker.NewAPI(&w, host, port, wLogger)
 	wg.Go(func() {
@@ -228,6 +261,7 @@ func doWork(done <-chan struct{}, workerNum int, logger *slog.Logger) (<-chan Up
 
 	go func() {
 		defer close(valueStream)
+
 		// Wait for the API and the RunTasks loop to exit first — otherwise
 		// RunTasks could start a fresh container behind our back while we're
 		// tearing them down.

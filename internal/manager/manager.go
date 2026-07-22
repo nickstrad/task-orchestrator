@@ -66,7 +66,9 @@ type WorkerMetadata struct {
 	Address string
 }
 
-func NewManager(workers []WorkerMetadata, schedulerType string, logger *slog.Logger, dbType string) *Manager {
+func NewManager(workers []WorkerMetadata, schedulerType string, logger *slog.Logger, dbType string) (*Manager, error) {
+	op := "manager.NewManager"
+
 	workerTaskMap := make(map[string][]uuid.UUID)
 
 	nodes := make([]node.Node, 0, len(workers))
@@ -77,7 +79,10 @@ func NewManager(workers []WorkerMetadata, schedulerType string, logger *slog.Log
 
 	s := scheduler.GetScheduler(schedulerType, logger)
 
-	dbs := store.GetDbs(dbType)
+	dbs, err := store.GetDBs(dbType, "manager", true)
+	if err != nil {
+		return nil, Wrap(op, fmt.Sprintf("unable to get dbs for db type '%s'", dbType), err)
+	}
 	return &Manager{
 		Pending:             queue.New[task.TaskEvent](),
 		TaskDb:              dbs.TaskDb,
@@ -91,7 +96,18 @@ func NewManager(workers []WorkerMetadata, schedulerType string, logger *slog.Log
 		updateInterval:      DefaultUpdateInterval,
 		processInterval:     DefaultProcessInterval,
 		healthCheckInterval: DefaultHealthCheckInterval,
+	}, nil
+}
+
+// Close releases the manager's stores. The persistent backend holds a file
+// handle and an exclusive lock per store that only Close frees, so shutdown
+// must call this. Both stores are closed even if the first errors.
+func (m *Manager) Close() error {
+	op := "manager.Close"
+	if err := errors.Join(m.TaskDb.Close(), m.EventDb.Close()); err != nil {
+		return Wrap(op, "unable to close stores", err)
 	}
+	return nil
 }
 
 // workerAddress returns the API address of a worker by name. WorkerNodes is set

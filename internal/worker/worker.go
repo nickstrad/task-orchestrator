@@ -26,9 +26,12 @@ type Worker struct {
 	logger *slog.Logger
 }
 
-func NewWorker(name string, id int, logger *slog.Logger, dbType string) Worker {
+func NewWorker(name string, id int, logger *slog.Logger, dbType string, freshStart bool) (Worker, error) {
+	dbs, err := store.GetDBs(dbType, name, freshStart)
 
-	dbs := store.GetDbs(dbType)
+	if err != nil {
+		return Worker{}, Wrap("worker.NewWorker", fmt.Sprintf("creating worker with name %s and id %d", name, id), err)
+	}
 
 	return Worker{
 		Name:   name,
@@ -36,7 +39,18 @@ func NewWorker(name string, id int, logger *slog.Logger, dbType string) Worker {
 		Db:     dbs.TaskDb,
 		Queue:  queue.New[task.Task](),
 		logger: logger,
+	}, nil
+}
+
+// Close releases the worker's store. The persistent backend holds a file
+// handle and an exclusive lock that only Close frees; the in-memory backend's
+// Close is a no-op. Shutdown must call this.
+func (w *Worker) Close() error {
+	op := "worker.Close"
+	if err := w.Db.Close(); err != nil {
+		return Wrap(op, "unable to close task store", err)
 	}
+	return nil
 }
 
 // LookupTask is lookupTask for callers outside this package — the API needs it

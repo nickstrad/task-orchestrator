@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/nickstrad/task-orchestrator/internal/task"
 )
@@ -12,7 +13,8 @@ import (
 var ErrNotFound = errors.New("element not found")
 
 const (
-	InMemoryDb = "IN_MEMORY"
+	InMemoryDb   = "IN_MEMORY"
+	PersistentDb = "PERSISTENT"
 )
 
 // Store is a keyed collection of one concrete type.
@@ -44,6 +46,7 @@ type Store[T any] interface {
 	Get(key string) (T, error)
 	List() ([]T, error)
 	Count() (int, error)
+	Close() error
 }
 
 // Dbs is the set of stores a Manager needs. A Worker takes only a
@@ -53,17 +56,46 @@ type Dbs struct {
 	TaskEventDb Store[task.TaskEvent]
 }
 
-// GetDbs builds the set of stores for a backend. Every dbType maps to the
-// in-memory backend rather than failing — it is the only backend that exists
-// today, so the parameter records intent and nothing more.
-//
-// When a persistent backend lands this should return an error for an unknown
-// type, so a typo in a config value does not silently hand back a store that
-// loses every write on exit. Branching on dbType before then would only be a
-// switch whose arms are all the same value.
-func GetDbs(dbType string) *Dbs {
+func GetInMemoryDbs() *Dbs {
 	return &Dbs{
 		TaskDb:      NewInMemory[task.Task](),
 		TaskEventDb: NewInMemory[task.TaskEvent](),
+	}
+}
+
+func GetPersistentDbs(id string, freshStart bool) (*Dbs, error) {
+	op := "store.GetPersistentDbs"
+
+	if id == "" {
+		return nil, E(op, "must pass in id", nil)
+	}
+
+	tDb, err := NewPersistentStore[task.Task](fmt.Sprintf("%s-tasks.db", id), 0600, "tasks", freshStart)
+	if err != nil {
+		return nil, Wrap(op, "unable to build task store", err)
+	}
+	tEventDb, err := NewPersistentStore[task.TaskEvent](fmt.Sprintf("%s-events.db", id), 0600, "events", freshStart)
+	if err != nil {
+		// tDb opened successfully; close it so its file handle and lock don't
+		// leak when we bail out here.
+		tDb.Close()
+		return nil, Wrap(op, "unable to build task event store", err)
+	}
+
+	return &Dbs{
+		TaskDb:      tDb,
+		TaskEventDb: tEventDb,
+	}, nil
+}
+
+func GetDBs(dbType, id string, freshStart bool) (*Dbs, error) {
+	op := "store.GetDBs"
+	switch dbType {
+	case InMemoryDb:
+		return GetInMemoryDbs(), nil
+	case PersistentDb:
+		return GetPersistentDbs(id, freshStart)
+	default:
+		return nil, E(op, fmt.Sprintf("unsupported db type %s", dbType), nil)
 	}
 }

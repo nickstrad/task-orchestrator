@@ -37,3 +37,5 @@ JUDGEMENT.md
 
 # Git worktrees created while executing plans
 .worktree/
+
+*.db
