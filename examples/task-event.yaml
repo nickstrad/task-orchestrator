@@ -1,0 +1,11 @@
+# A task event for `orchestrator run -f examples/task-event.yaml`.
+# States are integers: 0=Pending 1=Scheduled 2=Running 3=Completed 4=Failed.
+# IDs are omitted here and filled in with fresh UUIDs on submit.
+state: 2 # the event is Running
+task:
+  name: echo-server
+  state: 1 # the task starts Scheduled
+  image: timboring/echo-server:latest
+  exposedPorts:
+    7777/tcp: {}
+  healthCheck: /health

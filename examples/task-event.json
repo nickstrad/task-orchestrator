@@ -1,0 +1,10 @@
+{
+  "State": 2,
+  "Task": {
+    "Name": "echo-server",
+    "State": 1,
+    "Image": "timboring/echo-server:latest",
+    "ExposedPorts": { "7777/tcp": {} },
+    "HealthCheck": "/health"
+  }
+}

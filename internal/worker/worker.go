@@ -53,6 +53,40 @@ func (w *Worker) Close() error {
 	return nil
 }
 
+// Shutdown is the worker's cleanup path: it stops every container the worker
+// still owns and then closes its store. Call it once, on the way down, after
+// the API and RunTasks loop have stopped — otherwise RunTasks could start a
+// fresh container behind our back while we tear things down.
+//
+// It logs its own failures (the worker owns a logger) rather than returning
+// them: on the shutdown path there is no recovery to attempt, and leaving a
+// container running or a store open is worth saying out loud.
+func (w *Worker) Shutdown() {
+	// On the error path tasks is nil, so the loop below is a no-op and we still
+	// fall through to Close — no need to branch the whole loop into an else.
+	tasks, err := w.GetTasks()
+	if err != nil {
+		w.logger.Error("cannot stop worker tasks: listing tasks failed", "err", err)
+	}
+	for _, t := range tasks {
+		if t.ContainerID == "" || t.State == task.Completed {
+			continue
+		}
+		w.logger.Info("stopping container on shutdown", "taskID", t.ID, "containerID", t.ContainerID)
+		// StopTask expects the task to be heading for Completed; the queue
+		// normally sets that, but we're bypassing the queue here.
+		t.State = task.Completed
+		if result := w.StopTask(t); result.Error != nil {
+			w.logger.Error("stopping container on shutdown failed",
+				"err", result.Error, "taskID", t.ID, "containerID", t.ContainerID)
+		}
+	}
+
+	if err := w.Close(); err != nil {
+		w.logger.Error("closing worker store failed", "err", err)
+	}
+}
+
 // LookupTask is lookupTask for callers outside this package — the API needs it
 // to answer a stop request for a task the worker may not have.
 func (w *Worker) LookupTask(id uuid.UUID) (task.Task, bool) {

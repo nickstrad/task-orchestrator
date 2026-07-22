@@ -144,20 +144,29 @@ func TestRoundRobinSchedulerResumesAfterAnEmptyRound(t *testing.T) {
 }
 
 func TestGetSchedulerReturnsRoundRobin(t *testing.T) {
+	got, err := GetScheduler(RoundRobin, nil)
+	if err != nil {
+		t.Fatalf("GetScheduler(%q) returned error: %v", RoundRobin, err)
+	}
+	if _, ok := got.(*RoundRobinScheduler); !ok {
+		t.Errorf("GetScheduler(%q) = %T, want *RoundRobinScheduler", RoundRobin, got)
+	}
+}
+
+func TestGetSchedulerRejectsUnknownType(t *testing.T) {
 	tests := []struct {
 		name          string
 		schedulerType string
 	}{
-		{name: "the round-robin type", schedulerType: RoundRobin},
-		{name: "an unknown type falls back to round-robin", schedulerType: "nonsense"},
-		{name: "an empty type falls back to round-robin", schedulerType: ""},
+		{name: "an unknown type", schedulerType: "nonsense"},
+		{name: "an empty type", schedulerType: ""},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := GetScheduler(tt.schedulerType, nil)
-			if _, ok := got.(*RoundRobinScheduler); !ok {
-				t.Errorf("GetScheduler(%q) = %T, want *RoundRobinScheduler", tt.schedulerType, got)
+			got, err := GetScheduler(tt.schedulerType, nil)
+			if err == nil {
+				t.Errorf("GetScheduler(%q) = %T, nil; want an error", tt.schedulerType, got)
 			}
 		})
 	}

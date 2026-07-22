@@ -19,7 +19,10 @@ import (
 // what `go test -race` reports. Without w.mu this fails on Db, on Queue (a
 // plain linked list with no synchronisation of its own), and on Stats.
 func TestWorkerStateIsRaceFree(t *testing.T) {
-	w := NewWorker("worker-test", 0, slog.New(slog.DiscardHandler), store.InMemoryDb)
+	w, err := NewWorker("worker-test", 0, slog.New(slog.DiscardHandler), store.InMemoryDb, true)
+	if err != nil {
+		t.Fatalf("NewWorker: %v", err)
+	}
 
 	ids := make([]uuid.UUID, 8)
 	for i := range ids {
@@ -92,7 +95,10 @@ func TestWorkerStateIsRaceFree(t *testing.T) {
 // so the next pass marks it Failed and the manager restarts a task the
 // operator asked to stop.
 func TestUpsertTaskDoesNotResurrectAStoppedTask(t *testing.T) {
-	w := NewWorker("worker-test", 0, slog.New(slog.DiscardHandler), store.InMemoryDb)
+	w, err := NewWorker("worker-test", 0, slog.New(slog.DiscardHandler), store.InMemoryDb, true)
+	if err != nil {
+		t.Fatalf("NewWorker: %v", err)
+	}
 
 	id := uuid.New()
 	w.putTask(task.Task{ID: id, State: task.Running, ContainerID: "abc"})

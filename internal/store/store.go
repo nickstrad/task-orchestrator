@@ -96,6 +96,6 @@ func GetDBs(dbType, id string, freshStart bool) (*Dbs, error) {
 	case PersistentDb:
 		return GetPersistentDbs(id, freshStart)
 	default:
-		return nil, E(op, fmt.Sprintf("unsupported db type %s", dbType), nil)
+		return nil, E(op, fmt.Sprintf("unsupported db type %q: want %s or %s", dbType, InMemoryDb, PersistentDb), nil)
 	}
 }

@@ -18,7 +18,10 @@ import (
 func newTestAPI(t *testing.T) *API {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	w := NewWorker("worker-test", 0, logger, store.InMemoryDb)
+	w, err := NewWorker("worker-test", 0, logger, store.InMemoryDb, true)
+	if err != nil {
+		t.Fatalf("NewWorker: %v", err)
+	}
 	api := NewAPI(&w, "localhost", 0, logger)
 	api.initRouter()
 	return &api

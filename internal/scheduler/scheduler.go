@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"fmt"
 	"log/slog"
 
 	"github.com/nickstrad/task-orchestrator/internal/node"
@@ -41,14 +42,17 @@ type Scheduler interface {
 	Pick(scored []ScoredNode) node.Node
 }
 
-// GetScheduler returns the scheduler named by schedulerType, falling back to
-// round-robin for any name it does not recognise.
+// GetScheduler returns the scheduler named by schedulerType, or an error naming
+// the valid values for anything it does not recognise. It used to fall back to
+// round-robin for an unknown name, which silently ran a strategy the caller
+// never asked for; erroring here protects every caller, not just the ones that
+// happened to validate the flag themselves.
 //
 // A nil logger is accepted and discarded rather than rejected: callers that do
 // not care about scheduler logs (tests, mostly) should not have to build one,
 // and a nil *slog.Logger stored on a scheduler would panic at its first use
 // rather than here, which is much harder to place.
-func GetScheduler(schedulerType string, logger *slog.Logger) Scheduler {
+func GetScheduler(schedulerType string, logger *slog.Logger) (Scheduler, error) {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
@@ -58,8 +62,11 @@ func GetScheduler(schedulerType string, logger *slog.Logger) Scheduler {
 		return &MarginalCostScheduler{
 			Name:   MarginalCost,
 			logger: logger.With("subcomponent", "scheduler", "scheduler", MarginalCost),
-		}
+		}, nil
+	case RoundRobin:
+		return &RoundRobinScheduler{Name: RoundRobin}, nil
 	default:
-		return &RoundRobinScheduler{Name: RoundRobin}
+		return nil, fmt.Errorf("unsupported scheduler type %q: want %s or %s",
+			schedulerType, RoundRobin, MarginalCost)
 	}
 }

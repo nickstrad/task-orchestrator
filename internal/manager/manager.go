@@ -77,7 +77,10 @@ func NewManager(workers []WorkerMetadata, schedulerType string, logger *slog.Log
 		nodes = append(nodes, node.NewNode(w.Name, w.Address, "worker", logger))
 	}
 
-	s := scheduler.GetScheduler(schedulerType, logger)
+	s, err := scheduler.GetScheduler(schedulerType, logger)
+	if err != nil {
+		return nil, Wrap(op, "unable to get scheduler", err)
+	}
 
 	dbs, err := store.GetDBs(dbType, "manager", true)
 	if err != nil {

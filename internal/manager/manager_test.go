@@ -29,12 +29,16 @@ const testWorker = "w1"
 // newTestManager returns a manager whose only worker is reachable at addr.
 func newTestManager(t *testing.T, addr string) *Manager {
 	t.Helper()
-	return NewManager(
+	m, err := NewManager(
 		[]WorkerMetadata{{Name: testWorker, Address: addr}},
 		scheduler.RoundRobin,
 		slog.New(slog.DiscardHandler),
 		store.InMemoryDb,
 	)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	return m
 }
 
 // deadWorkerAddr returns an address nothing is listening on, for the
@@ -168,7 +172,10 @@ func TestUpdateTasksPollsWorkersConcurrently(t *testing.T) {
 		})
 	}
 
-	m := NewManager(workers, scheduler.RoundRobin, slog.New(slog.DiscardHandler), store.InMemoryDb)
+	m, err := NewManager(workers, scheduler.RoundRobin, slog.New(slog.DiscardHandler), store.InMemoryDb)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
 	for _, id := range taskIDs {
 		seedTask(t, m, task.Task{ID: id, State: task.Scheduled})
 	}
